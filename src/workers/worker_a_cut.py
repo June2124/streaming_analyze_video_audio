@@ -3,7 +3,7 @@ from __future__ import annotations
 '''
 Author: 13594053100@163.com
 Date: 2025-10-08 14:30:47
-LastEditTime: 2025-10-13 18:29:03
+LastEditTime: 2025-10-13 20:31:22
 '''
 # -*- coding: utf-8 -*-
 
@@ -16,13 +16,17 @@ LastEditTime: 2025-10-13 18:29:03
     (若启用B且存在视频)
     q_video.put({
         "path": <无声小视频>, "t0": <秒>, "t1": <秒>,
+        "clip_t0": <秒>, "clip_t1": <秒>,                  # 显式命名
         "segment_index": <int>,
         "mode": "offline|online|security",
         "win": <float>, "step": <float>, "overlap_sec": <float>,
         "has_audio": <bool>,
-        "keyframes": [<jpg路径>...],
+        "keyframes": [<jpg路径>...],                       # 关键帧/快照（若策略选择了图像）
+        "frame_pts": [<float秒>...],                       # 与 keyframes 一一对应（源时间线）
+        "frame_indices": [<int>...],                       # 可选：帧索引（相对该片段 v_out）
         "keyframe_count": <int>,
         "small_video": <压缩后mp4路径或 None>,
+        "small_video_fps": <float或None>,                  # 若走小视频策略则提供
         "hires": <bool>,
         "policy": {
             "significant_motion": <bool>,
@@ -49,7 +53,6 @@ import cv2
 import time
 import re
 import os
-import threading
 
 from src.all_enum import MODEL
 from src.utils.ffmpeg_utils import FFmpegUtils
@@ -72,6 +75,21 @@ def _imwrite_jpg(path: str, img, quality: int = 90) -> str:
     with open(path, "wb") as f:
         f.write(buf.tobytes())
     return path
+
+
+def _get_video_meta(video_path: str) -> Tuple[float, int]:
+    """返回 (fps, total_frames)；失败时回退 (25.0, 0)"""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return 25.0, 0
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    finally:
+        cap.release()
+    if fps <= 0:
+        fps = 25.0
+    return fps, total
 
 
 # -------------------- 窗口/步长策略 --------------------
@@ -156,6 +174,7 @@ def silence_detect_hint(
     使用 FFmpeg silencedetect 对标准化后的 WAV（16kHz/mono/PCM16）做静音探测。
     返回：{"silence_ratio": <0~1>, "is_mostly_silent": <bool>, "segments": [(s,e)...]}
     """
+    import re, subprocess
     start_re = re.compile(r"silence_start:\s*([0-9.]+)")
     end_re = re.compile(r"silence_end:\s*([0-9.]+)\s*\|\s*silence_duration:\s*([0-9.]+)")
 
@@ -227,8 +246,8 @@ def silence_detect_hint(
     }
 
 
-# -------------------- 关键帧/快照 --------------------
-def extract_keyframes_by_interval(
+# -------------------- 关键帧/快照（含 PTS） --------------------
+def extract_keyframes_by_interval_with_pts(
     video_path: str,
     out_dir: str,
     tag: str,
@@ -238,35 +257,38 @@ def extract_keyframes_by_interval(
     jpg_quality: int = 90,
     max_frames: Optional[int] = None,
     *,
-    probe_only: bool = False,
-    return_stats: bool = False,
-    max_samples_for_probe: int = 30,
-):
+    seg_t0: float,
+) -> Tuple[List[str], List[float], List[int]]:
+    """
+    与原 extract_keyframes_by_interval 类似，但返回 (paths, pts_list, frame_indices)：
+    - pts_list 为“源视频时间线”上的时间戳： seg_t0 + frame_idx / fps
+    - frame_indices 为该片段文件 v_out 内部的帧索引
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return {"avg_diff": 0.0, "max_diff": 0.0, "samples": 0} if (probe_only and return_stats) else []
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        return [], [], []
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+    if fps <= 0:
+        fps = 25.0
     step = max(1, int(round(fps * interval_sec)))
-    saved: List[str] = []
+
+    paths: List[str] = []
+    pts: List[float] = []
+    fidx: List[int] = []
+
     last_small = None
     diffs: List[float] = []
+    cur_idx = -1
     try:
         while True:
+            # 跳过 step-1 帧，抓一帧参与相邻差分
             for _ in range(step - 1):
                 if not cap.grab():
-                    if probe_only and return_stats:
-                        if not diffs:
-                            return {"avg_diff": 0.0, "max_diff": 0.0, "samples": 0}
-                        return {
-                            "avg_diff": float(sum(diffs) / len(diffs)),
-                            "max_diff": float(max(diffs)),
-                            "samples": len(diffs),
-                        }
-                    return saved
+                    return paths, pts, fidx
             ret, frame = cap.read()
             if not ret:
                 break
+            cur_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1  # 当前读出的帧索引
             h, w = frame.shape[:2]
             small_h = max(1, int(h * (resize_w / max(1, w))))
             small = cv2.resize(frame, (resize_w, small_h), interpolation=cv2.INTER_AREA)
@@ -279,56 +301,62 @@ def extract_keyframes_by_interval(
                 save = score >= diff_threshold
             last_small = small
 
-            if probe_only:
-                if len(diffs) >= max_samples_for_probe:
-                    break
-                continue
-
             if save:
-                name = f"{tag}_kf_{len(saved):04d}.jpg"
+                name = f"{tag}_kf_{len(paths):04d}.jpg"
                 out_path = os.path.join(out_dir, name)
                 _imwrite_jpg(out_path, frame, quality=jpg_quality)
-                saved.append(out_path)
-                if max_frames and len(saved) >= max_frames:
+                paths.append(out_path)
+                pts.append(float(seg_t0) + (cur_idx / fps))
+                fidx.append(cur_idx)
+                if max_frames and len(paths) >= max_frames:
                     break
     finally:
         cap.release()
-
-    if probe_only and return_stats:
-        if not diffs:
-            return {"avg_diff": 0.0, "max_diff": 0.0, "samples": 0}
-        return {"avg_diff": float(sum(diffs) / len(diffs)), "max_diff": float(max(diffs)), "samples": len(diffs)}
-    return saved
+    return paths, pts, fidx
 
 
-def sample_fixed_frames(video_path: str, out_dir: str, tag: str, count: int = 2, jpg_quality: int = 90) -> List[str]:
+def sample_fixed_frames_with_pts(
+    video_path: str, out_dir: str, tag: str, count: int = 2, jpg_quality: int = 90, *,
+    seg_t0: float
+) -> Tuple[List[str], List[float], List[int]]:
+    """
+    返回 (paths, pts_list, frame_indices)
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return []
+        return [], [], []
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+    if fps <= 0:
+        fps = 25.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     if total <= 0:
         cap.release()
-        return []
-    idxs = []
+        return [], [], []
+
+    # 选帧索引
+    idxs: List[int] = []
     if count <= 1:
         idxs = [total // 2]
     else:
         for k in range(count):
             idxs.append(int(round((k + 1) / (count + 1) * total)))
-    saved = []
+
+    paths, pts, fidx = [], [], []
     try:
         for idx in idxs:
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = cap.read()
             if not ret or frame is None:
                 continue
-            name = f"{tag}_snap_{len(saved):04d}.jpg"
+            name = f"{tag}_snap_{len(paths):04d}.jpg"
             out_path = os.path.join(out_dir, name)
             _imwrite_jpg(out_path, frame, quality=jpg_quality)
-            saved.append(out_path)
+            paths.append(out_path)
+            pts.append(float(seg_t0) + (idx / fps))
+            fidx.append(idx)
     finally:
         cap.release()
-    return saved
+    return paths, pts, fidx
 
 
 # -------------------- 关键帧/小视频策略表 --------------------
@@ -393,13 +421,6 @@ def _safe_put_with_ctrl(
     q: Optional[Queue], obj: dict, q_ctrl: Queue, stop: object,
     *, timeout=0.2, max_tries=50
 ) -> bool:
-    """
-    尝试多次短超时 put；
-    期间非阻塞轮询控制队列；
-    一旦检测到 STOP/SHUTDOWN 或超过重试上限，返回 False；
-    投递成功返回 True。
-    若 q 为 None，表示该数据面未启用，直接返回 False（视为跳过投递）。
-    """
     if q is None:
         return False
 
@@ -411,7 +432,6 @@ def _safe_put_with_ctrl(
             if msg is stop or (isinstance(msg, dict) and msg.get("type") in ("STOP", "SHUTDOWN")):
                 logger.info("[A] 检测到控制队列 STOP，停止将本次切片传递到数据队列。")
                 return False
-            # 其他控制消息丢回去（不吞）
             try:
                 q_ctrl.put_nowait(msg)
             except Full:
@@ -444,13 +464,6 @@ def worker_a_cut(
     q_ctrl: Queue,
     stop: object,
 ):
-    """
-    A线程：切窗 + 标准化 + （按模式）关键帧策略。
-    注意：
-      - A 不向下游队列发 STOP 哨兵；只有主控在合适时机发。
-      - 控制通道同时识别 stop 对象和 {"type":"STOP"} 字典。
-      - 离线：切完整个文件（尾窗兜底）后退出；实时：常驻。
-    """
     running = False
     paused = False
     cur_mode = mode
@@ -530,7 +543,7 @@ def worker_a_cut(
             # 窗口/步长（含 offline 重叠）
             win, step = _mode_window_policy(cur_mode, desire_win, overlap_sec)
 
-            # 离线 EOF：用 t0 与 max_duration 判定；offline 做一次尾窗兜底
+            # 离线 EOF
             if max_duration is not None and t0 >= max_duration:
                 if cur_mode == MODEL.OFFLINE and not tail_emitted and max_duration > 0:
                     new_t0 = max(0.0, max_duration - win)
@@ -544,38 +557,38 @@ def worker_a_cut(
                     logger.info("[A] 离线已切完，退出")
                     return
 
-            # ---- 切窗+标准化（输出：可能仅音频 / 可能仅视频 / 也可能都有）----
+            # ---- 切窗+标准化 ----
             seg = FFmpegUtils.cut_and_standardize_segment(
                 src_url=url, start_time=t0, duration=win,
                 output_dir=out_dir, segment_index=seg_idx, have_audio=have_audio_track
             )
             v_out = seg.get("video_path")  # 可能为 None（纯音频源）
             a_out = seg.get("audio_path")  # 可能为 None（纯视频源或无音轨）
-
             has_v = bool(v_out)
             has_a = bool(a_out)
 
-            # “是否要产出音频”：需要有音轨、q_audio 可用，并且本段确实切出了 a_out
+            # 是否产出音频
             produce_audio = bool(have_audio_track and q_audio is not None and has_a)
 
-            # ---- 静音提示：仅当要产出音频时才做 ----
+            # 静音提示
             if produce_audio:
                 silence_hint = silence_detect_hint(a_out)
             else:
                 silence_hint = {"silence_ratio": 0.0, "is_mostly_silent": False, "segments": []}
 
-            # ---- 运动检测 & 关键帧/小视频策略：仅当有视频且启用了 B（q_video 可用）时才做 ----
+            # 运动 & 关键帧策略（仅当有视频且启用 B）
             keyframes: List[str] = []
+            frame_pts: List[float] = []
+            frame_indices: List[int] = []
             small_video_path: Optional[str] = None
-            policy_used = None
+            small_video_fps: Optional[float] = None
+            policy_used = "none"
             hires_flag = False
 
             if has_v and q_video is not None:
-                # 轻量运动探测
                 signif = fast_motion_detect_placeholder(
                     v_out, sample_interval=1.0, diff_threshold=15.0, max_samples=30
                 )
-                # 关键帧/小视频策略
                 vlm_policy = decide_vlm_sampling(cur_mode, signif)
                 hires_flag = vlm_policy["hires"]
                 tag = f"seg{seg_idx:04d}"
@@ -588,32 +601,36 @@ def worker_a_cut(
                         fps=enc.get("fps", 8), height=enc.get("height", 480),
                         crf=enc.get("crf", 28), preset=enc.get("preset", "veryfast")
                     )
+                    small_video_fps, _ = _get_video_meta(small_video_path)
                     policy_used = "small_video"
                 elif vlm_policy["use_fixed_sampling"]:
-                    keyframes = sample_fixed_frames(v_out, out_dir, tag, count=vlm_policy["fixed_count"])
+                    ks, pts, idxs = sample_fixed_frames_with_pts(
+                        v_out, out_dir, tag, count=vlm_policy["fixed_count"], jpg_quality=90, seg_t0=seg["t0"]
+                    )
+                    keyframes, frame_pts, frame_indices = ks, pts, idxs
                     policy_used = "fixed_sampling"
                 elif vlm_policy["extract_keyframes"]:
                     dynamic_max = vlm_policy.get("max_frames")
-                    keyframes = extract_keyframes_by_interval(
+                    ks, pts, idxs = extract_keyframes_by_interval_with_pts(
                         v_out, out_dir, tag,
                         interval_sec=vlm_policy["interval_sec"],
                         diff_threshold=0.65,
                         max_frames=dynamic_max,
+                        seg_t0=seg["t0"]
                     )
+                    keyframes, frame_pts, frame_indices = ks, pts, idxs
                     policy_used = "keyframes"
             else:
                 signif = False
-                policy_used = "none"
-                hires_flag = False
-                small_video_path = None
-                keyframes = []
 
-            # ---- 投递到视频队列：仅当有视频且 q_video 可用 ----
+            # ---- 投视频队列 ----
             if has_v and q_video is not None:
                 payload_video = {
                     "path": v_out,
                     "t0": seg["t0"],
                     "t1": seg["t1"],
+                    "clip_t0": seg["t0"],              # 显式别名
+                    "clip_t1": seg["t1"],              # 显式别名
                     "segment_index": seg_idx,
                     "mode": cur_mode.value,
                     "win": win,
@@ -621,8 +638,11 @@ def worker_a_cut(
                     "overlap_sec": overlap_sec if cur_mode == MODEL.OFFLINE else 0.0,
                     "has_audio": has_a,
                     "keyframes": keyframes,
+                    "frame_pts": frame_pts,            # 与 keyframes 对齐
+                    "frame_indices": frame_indices,    # 可选：片段内帧索引
                     "keyframe_count": len(keyframes),
                     "small_video": small_video_path,
+                    "small_video_fps": small_video_fps, # 小视频 FPS
                     "hires": hires_flag,
                     "policy": {
                         "significant_motion": bool(signif),
@@ -639,7 +659,7 @@ def worker_a_cut(
                 if not ok:
                     return  # 退出 A 线程
 
-            # ---- 投递到音频队列：仅当“准备产出音频”且 q_audio 可用 ----
+            # ---- 投音频队列 ----
             if produce_audio and q_audio is not None:
                 audio_payload = {
                     "path": a_out,
@@ -655,17 +675,15 @@ def worker_a_cut(
                 if not ok:
                     return
 
-            # ---- 步进；offline 尾窗已发过的话，把 t0 推到 EOF 以便下一轮退出 ----
+            # 步进
             seg_idx += 1
             t0 += step
             if tail_emitted and max_duration is not None:
                 t0 = max_duration
 
-            # 让出 GIL
             sleep(0.005)
 
     except Exception as e:
         logger.error(f"[A] 运行时异常，线程退出：{e}")
-        # 注意：A 不主动给下游发 STOP；由主控在合适时机发哨兵
     finally:
         logger.info('[A] 线程退出清理完成')

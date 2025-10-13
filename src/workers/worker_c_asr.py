@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-
 import os
 import time
 import queue
 import wave
 import logging
 import threading
-from typing import Optional, Dict, Any, Iterable
+from datetime import datetime
+from typing import Optional, Dict, Any, Iterable, List, Tuple
 
 logger = logging.getLogger("src.workers.worker_c_asr")
 
@@ -22,19 +22,16 @@ except Exception:
 # ----------- Paraformer SDK -----------
 try:
     import dashscope  # type: ignore
-    from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult  # type: ignore
+    from dashscope.audio.asr import Recognition, RecognitionCallback  # type: ignore
     _HAVE_PARA = True
 except Exception as e:
     _HAVE_PARA = False
     _PARA_IMPORT_ERR = e
 
 
-# ========== 工具：读 WAV 并转成 100ms PCM16 块 ==========
+# ================= 工具 =================
 def _iter_pcm_frames_from_wav(wav_path: str, *, block_bytes: int = 3200) -> Iterable[bytes]:
-    """
-    读取 16kHz/mono/PCM16 WAV，按 100ms(3200B) 切块产出纯 PCM16。
-    要求：A 侧已标准化为 16kHz/mono/PCM16。
-    """
+    """读取 16kHz/mono/PCM16 WAV，按 100ms(3200B) 切块产出纯 PCM16。"""
     with wave.open(wav_path, "rb") as wf:
         nch = wf.getnchannels()
         sbytes = wf.getsampwidth()
@@ -42,13 +39,17 @@ def _iter_pcm_frames_from_wav(wav_path: str, *, block_bytes: int = 3200) -> Iter
         if not (nch == 1 and sbytes == 2 and rate == 16000):
             raise ValueError(f"WAV 参数不符，期待 16k/mono/PCM16，实际: ch={nch}, sw={sbytes}, sr={rate}")
         while True:
-            data = wf.readframes(block_bytes // sbytes)  # 样本数 = 字节数 / 2
+            data = wf.readframes(block_bytes // sbytes)
             if not data:
                 break
             yield data
 
 
-# ========== 可选 VAD：优先 WebRTC，失败用能量阈值 ==========
+def _iso_local(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+# ======== 可选 VAD：优先 WebRTC，失败用能量阈值 ========
 def _analyze_vad_active_ratio(
     wav_path: str,
     *,
@@ -79,19 +80,15 @@ def _analyze_vad_active_ratio(
         with wave.open(wav_path, "rb") as wf:
             nch, sw, sr = wf.getnchannels(), wf.getsampwidth(), wf.getframerate()
             if not (nch == 1 and sw == 2 and sr == 16000):
-                # A 已标准化，这里只做兜底
                 return {"is_speech": True, "active_ratio": 1.0, "backend_used": "disabled", "applied_params": applied}
             pcm = wf.readframes(wf.getnframes())
     except Exception as e:
         logger.warning(f"[C] VAD 读取 WAV 失败，降级：{e}")
         return {"is_speech": True, "active_ratio": 1.0, "backend_used": "disabled", "applied_params": applied}
 
-    # 优先 webrtcvad
     if _HAVE_WEBRTCVAD:
         try:
             vad = webrtcvad.Vad(int(aggr))
-            step = frame_ms * 16  # 16k mono 16bit -> 每毫秒 16*2=32B，每 20ms 是 640B；但我们按采样数来切
-            # 以采样为粒度：frame_ms * sr / 1000 样本，每样本 2B
             frame_bytes = int(sr * frame_ms / 1000) * 2
             total = 0
             act = 0
@@ -99,7 +96,6 @@ def _analyze_vad_active_ratio(
                 chunk = pcm[i:i + frame_bytes]
                 if len(chunk) < frame_bytes:
                     break
-                # webrtcvad 要求 10/20/30ms
                 if vad.is_speech(chunk, sr):
                     act += 1
                 total += 1
@@ -113,16 +109,13 @@ def _analyze_vad_active_ratio(
         except Exception as e:
             logger.warning(f"[C] WebRTC VAD 失败，能量兜底：{e}")
 
-    # 简单能量阈值兜底（RMS-> dBFS）
+    # 简易能量阈值
     try:
         import array, math
         pcm_i16 = array.array("h", pcm)
         if not pcm_i16:
             return {"is_speech": False, "active_ratio": 0.0, "backend_used": "energy", "applied_params": applied}
-        # 分帧计算 RMS dBFS
-        frame_samples = int(sr * frame_ms / 1000)
-        if frame_samples <= 0:
-            frame_samples = 320  # 20ms
+        frame_samples = int(sr * frame_ms / 1000) or 320
         total = 0
         act = 0
         for i in range(0, len(pcm_i16), frame_samples):
@@ -130,11 +123,10 @@ def _analyze_vad_active_ratio(
             if not frm:
                 break
             rms = math.sqrt(sum(int(x) * int(x) for x in frm) / len(frm))
-            # 15-bit peak for PCM16 normalized to 1.0 => dbfs approx
             if rms <= 1e-6:
                 dbfs = -90.0
             else:
-                dbfs = 20.0 * math.log10(rms / 32768.0 * 2.0)  # 粗略
+                dbfs = 20.0 * math.log10(rms / 32768.0 * 2.0)
             if dbfs > energy_dbfs_thresh:
                 act += 1
             total += 1
@@ -149,15 +141,14 @@ def _analyze_vad_active_ratio(
         return {"is_speech": True, "active_ratio": 1.0, "backend_used": "disabled", "applied_params": applied}
 
 
-# ========== Paraformer 回调：收 sentence_end 句级结果 ==========
+# ======== Paraformer 回调：收 sentence_end 句级结果 ========
 class _ParaCallback(RecognitionCallback):
     def __init__(self):
-        self.sentences = []         # 收到的句对象（只存 sentence_end=True 的）
+        self.sentences: List[dict] = []  # 仅存 sentence_end=True 的句对象
         self._lock = threading.Lock()
         self._done = threading.Event()
         self._err: Optional[str] = None
 
-    # 录音相关 on_open/on_close 在离线文件模式不需要
     def on_complete(self) -> None:
         self._done.set()
 
@@ -176,16 +167,14 @@ class _ParaCallback(RecognitionCallback):
             sentence = result.get_sentence()  # dict
         except Exception:
             return
-        # 只保留句末
         if sentence and sentence.get("sentence_end", False):
             with self._lock:
                 self.sentences.append(sentence)
 
-    # 工具
     def wait_done(self, timeout: Optional[float]) -> bool:
         return self._done.wait(timeout=timeout)
 
-    def fetch_sentences(self):
+    def fetch_sentences(self) -> List[dict]:
         with self._lock:
             out = list(self.sentences)
             self.sentences.clear()
@@ -193,6 +182,30 @@ class _ParaCallback(RecognitionCallback):
 
     def has_error(self) -> bool:
         return self._err is not None
+
+
+# ======== 从句对象中尽力解析开始/结束时间（ms） ========
+def _extract_sentence_times_ms(s: dict) -> Tuple[Optional[float], Optional[float]]:
+    """
+    兼容多种潜在字段：end_time/end_ms/end、start_time/begin_time/start_ms/start、ts 等
+    返回 (start_ms, end_ms)，若无则为 (None, None)
+    """
+    def _get_any(d, keys):
+        for k in keys:
+            v = d.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except Exception:
+                    pass
+        return None
+
+    end_ms = _get_any(s, ("end_time", "end_ms", "end", "etime", "ts_end"))
+    if end_ms is None:
+        # 有些只给一个 ts，当作 end
+        end_ms = _get_any(s, ("ts", "time_ms", "time"))
+    start_ms = _get_any(s, ("start_time", "begin_time", "start_ms", "start", "stime", "ts_begin"))
+    return start_ms, end_ms
 
 
 # ========== 主体：C 线程 ==========
@@ -205,21 +218,19 @@ def worker_c_asr(
     """
     - 从 q_audio 取离线 wav 段，先做 VAD 预判，再推往 Paraformer 做识别。
     - 只在 sentence_end=True 时投递句级增量，段尾投收尾。
-    - 收到 STOP/SHUTDOWN 立即退出。
+    - 每个句级增量带上 media_ts（对齐到视频时间线）与 clip_t0/clip_t1。
     """
     logger.info("[C] 线程启动: C-ASR转录")
-    # 读取 API Key
-    if _HAVE_PARA:
-        if "DASHSCOPE_API_KEY" in os.environ:
-            dashscope.api_key = os.environ["DASHSCOPE_API_KEY"]
+    if _HAVE_PARA and "DASHSCOPE_API_KEY" in os.environ:
+        dashscope.api_key = os.environ["DASHSCOPE_API_KEY"]
 
     # 配置
     asr_model = os.getenv("ASR_MODEL", "paraformer-realtime-v2")
-    lang = os.getenv("ASR_LANG", "zh")  # 仅作标注
+    lang = os.getenv("ASR_LANG", "zh")
     sr_hz = 16000
     block_bytes = 3200  # 100ms
 
-    # VAD 开关
+    # VAD
     vad_enabled = os.getenv("ASR_VAD_ENABLED", "1") == "1"
     vad_aggr = int(os.getenv("ASR_VAD_AGGR", "1"))
     vad_dbfs = float(os.getenv("ASR_VAD_DBFS", "-45"))
@@ -235,7 +246,6 @@ def worker_c_asr(
                 if ctrl is stop or (isinstance(ctrl, dict) and ctrl.get("type") in ("STOP", "SHUTDOWN")):
                     logger.info("[C] 收到控制队列 STOP ，退出")
                     return False
-                # 非 STOP 放回去
                 try:
                     q_ctrl.put_nowait(ctrl)
                 except queue.Full:
@@ -262,13 +272,12 @@ def worker_c_asr(
             try:
                 item = q_audio.get(timeout=0.1)
             except queue.Empty:
-                # 也要监听 STOP
+                # 监听 STOP
                 try:
                     msg = q_ctrl.get_nowait()
                     if msg is stop or (isinstance(msg, dict) and msg.get("type") in ("STOP", "SHUTDOWN")):
                         logger.info("[C] 收到控制队列 STOP ，退出")
                         return
-                    # 其他控制丢回去
                     try:
                         q_ctrl.put_nowait(msg)
                     except queue.Full:
@@ -282,8 +291,8 @@ def worker_c_asr(
                 return
 
             a_path = item.get("path")
-            t0 = float(item.get("t0", 0.0))
-            t1 = float(item.get("t1", 0.0))
+            t0 = float(item.get("t0", 0.0))  # clip_t0
+            t1 = float(item.get("t1", 0.0))  # clip_t1
             seg_idx = item.get("segment_index")
             if seg_idx is None:
                 seg_idx = seg_auto_idx
@@ -305,6 +314,7 @@ def worker_c_asr(
                     logger.warning(f"[C] VAD 失败，降级直接转写：{e}")
 
             if not vad_info.get("is_speech", True):
+                now_ts = time.time()
                 ok = _q_put_with_retry({
                     "type": "asr_stream_no_speech",
                     "segment_index": seg_idx,
@@ -314,15 +324,17 @@ def worker_c_asr(
                     "latency_ms": 0,
                     "lang": lang,
                     "sr_hz": sr_hz,
-                    "t0": t0, "t1": t1
+                    "t0": t0, "t1": t1,
+                    "produce_ts": now_ts,
+                    "produce_iso": _iso_local(now_ts),
                 })
                 if not ok:
                     return
                 continue
 
             if not _HAVE_PARA:
+                now_ts = time.time()
                 logger.error(f"[C] 未安装/导入 Paraformer SDK（dashscope）失败：{_PARA_IMPORT_ERR}")
-                # 直接当作无声跳过（或根据需要 raise）
                 ok = _q_put_with_retry({
                     "type": "asr_stream_no_speech",
                     "segment_index": seg_idx,
@@ -332,7 +344,9 @@ def worker_c_asr(
                     "latency_ms": 0,
                     "lang": lang,
                     "sr_hz": sr_hz,
-                    "t0": t0, "t1": t1
+                    "t0": t0, "t1": t1,
+                    "produce_ts": now_ts,
+                    "produce_iso": _iso_local(now_ts),
                 })
                 if not ok:
                     return
@@ -341,12 +355,13 @@ def worker_c_asr(
             # ---------- Paraformer：仅句级 ----------
             cb = _ParaCallback()
             recog = Recognition(
-                model=asr_model,
-                format='pcm',           # 我们发送纯 PCM 块
+                model=os.getenv("ASR_MODEL", "paraformer-realtime-v2"),
+                format='pcm',
                 sample_rate=sr_hz,
                 semantic_punctuation_enabled=True,
                 callback=cb
             )
+
             start_ts = time.time()
             try:
                 recog.start()
@@ -365,8 +380,7 @@ def worker_c_asr(
                         pass
 
                     recog.send_audio_frame(pcm)
-
-                recog.stop()  # 发送完当前段
+                recog.stop()
             except Exception as e:
                 logger.warning(f"[C] Paraformer 发送/停止异常：{e}")
 
@@ -375,26 +389,67 @@ def worker_c_asr(
             if cb.has_error():
                 logger.warning("[C] Paraformer 识别报错（已记录），继续后续段。")
 
-            sentences = cb.fetch_sentences()  # 只包含 sentence_end=True 的句对象
-            # 投句级增量
+            sentences = cb.fetch_sentences()  # 仅 sentence_end=True
+            n_sent = len(sentences)
+            dur = max(0.0, t1 - t0) if (t1 >= t0) else 0.0
+
+            # 先预解析每句 (start_ms, end_ms)
+            sent_ms_list: List[Tuple[Optional[float], Optional[float]]] = [
+                _extract_sentence_times_ms(s) for s in sentences
+            ]
+
+            # 如果完全没有时间戳，备用线性分布：把每句的 end 均分到 [t0,t1]
+            linear_end_ts = []
+            if n_sent > 0:
+                for i in range(1, n_sent + 1):
+                    # i/n_sent 百分位
+                    frac = i / n_sent
+                    linear_end_ts.append(t0 + frac * dur)
+
+            # 投句级增量（带 media_ts）
             seq = 0
-            concat_texts = []
-            for s in sentences:
+            concat_texts: List[str] = []
+            sentence_times_abs: List[Dict[str, Optional[float]]] = []
+
+            for idx, s in enumerate(sentences):
                 text = (s.get("text") or "").strip()
                 if not text:
                     continue
+
+                start_ms, end_ms = sent_ms_list[idx]
+                # 计算绝对时间
+                if end_ms is not None:
+                    media_ts = t0 + float(end_ms) / 1000.0
+                elif start_ms is not None:
+                    media_ts = t0 + float(start_ms) / 1000.0
+                else:
+                    media_ts = linear_end_ts[idx] if (idx < len(linear_end_ts)) else (t0 + 0.5 * dur)
+
+                # 记录句级时间范围（若有）
+                sent_abs = {
+                    "start_ts": (t0 + float(start_ms) / 1000.0) if start_ms is not None else None,
+                    "end_ts":   (t0 + float(end_ms) / 1000.0)   if end_ms is not None else None,
+                }
+                sentence_times_abs.append(sent_abs)
+
                 concat_texts.append(text)
                 seq += 1
+                now_ts = time.time()
+
                 ok = _q_put_with_retry({
                     "type": "asr_stream_delta",
                     "segment_index": seg_idx,
                     "seq": seq,
-                    "delta": text,  # 句级增量 = 本句全文
+                    "delta": text,                  # 句级增量 = 本句全文
                     "usage": {"vad": vad_info, "silence_hint": item.get("silence_hint")},
                     "model": asr_model,
                     "lang": lang,
                     "sr_hz": sr_hz,
-                    "t0": t0, "t1": t1
+                    "t0": t0, "t1": t1,            # 片段边界
+                    "media_ts": float(media_ts),    # 对应视频时间（秒，绝对）
+                    "media_ts_iso": _iso_local(media_ts),
+                    "produce_ts": now_ts,           # 发射时刻
+                    "produce_iso": _iso_local(now_ts),
                 })
                 if not ok:
                     return
@@ -402,6 +457,7 @@ def worker_c_asr(
             # 段尾收尾
             latency_ms = int((time.time() - start_ts) * 1000)
             full_text = "".join(concat_texts)
+            now_ts = time.time()
             ok = _q_put_with_retry({
                 "type": "asr_stream_done",
                 "segment_index": seg_idx,
@@ -411,7 +467,10 @@ def worker_c_asr(
                 "latency_ms": latency_ms,
                 "lang": lang,
                 "sr_hz": sr_hz,
-                "t0": t0, "t1": t1
+                "t0": t0, "t1": t1,
+                "sentence_times": sentence_times_abs,  # 每句的绝对时间范围（若 SDK 提供）
+                "produce_ts": now_ts,
+                "produce_iso": _iso_local(now_ts),
             })
             if not ok:
                 return

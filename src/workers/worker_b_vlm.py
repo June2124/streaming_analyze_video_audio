@@ -1,18 +1,12 @@
-from __future__ import annotations
-
-'''
-Author: 13594053100@163.com
-Date: 2025-10-08 14:31:09
-LastEditTime: 2025-10-13 18:34:20
-'''
-
 # -*- coding: utf-8 -*-
+from __future__ import annotations
 
 import os
 import time
 from typing import List, Dict, Any, Optional, Iterator, Tuple
 from queue import Queue, Empty
 import threading
+from collections import deque
 
 from src.utils import logger_utils
 
@@ -37,22 +31,17 @@ def _to_file_uri(path_or_uri: str) -> Optional[str]:
     """
     将本地路径统一为 file:// 绝对 URI；http(s)/已是 file:// 原样返回。
     Windows: file://D:/abs/path/file.mp4
-    Linux/Mac: file:///abs/path/file.mp4 （这里用 file:// + 绝对路径，dashscope 实测可用）
+    Linux/Mac: file:///abs/path/file.mp4
     """
     if not path_or_uri:
         return None
     if _is_http_url(path_or_uri) or path_or_uri.lower().startswith("file://"):
         return path_or_uri
-    abs_path = os.path.abspath(path_or_uri)
-    # 统一用正斜杠，避免 Windows 反斜杠
-    abs_path = abs_path.replace("\\", "/")
+    abs_path = os.path.abspath(path_or_uri).replace("\\", "/")
     return f"file://{abs_path}"
 
 
 def _exists_local_from_uri(file_uri_or_path: str) -> bool:
-    """
-    file:// -> 落地检查；http(s) 直接 True；普通本地路径也检查。
-    """
     if not file_uri_or_path:
         return False
     if _is_http_url(file_uri_or_path):
@@ -65,16 +54,7 @@ def _exists_local_from_uri(file_uri_or_path: str) -> bool:
 
 def _build_msgs_for_video(video_uri: str, user_prompt: Optional[str]) -> List[Dict[str, Any]]:
     prompt = user_prompt or "请基于这段视频给出简洁的中文要点描述（事件、场景、角色、物体）。"
-    # DashScope MMC 消息结构
-    return [
-        {
-            "role": "user",
-            "content": [
-                {"video": video_uri},
-                {"text": prompt}
-            ]
-        }
-    ]
+    return [{"role": "user", "content": [{"video": video_uri}, {"text": prompt}]}]
 
 
 def _build_msgs_for_images(img_uris: List[str], user_prompt: Optional[str]) -> List[Dict[str, Any]]:
@@ -86,7 +66,6 @@ def _build_msgs_for_images(img_uris: List[str], user_prompt: Optional[str]) -> L
 
 
 def _q_put_with_retry(q: Queue, obj: Any, *, tries: int = 3, timeout: float = 0.5) -> bool:
-    """队列投递带有限重试，避免短暂阻塞直接失败。"""
     for i in range(1, tries + 1):
         try:
             q.put(obj, timeout=timeout)
@@ -121,10 +100,6 @@ def _resolve_prompt(global_prompt: Optional[str], mode_str: Optional[str]) -> Op
 
 # ----------------- 重试 & 事件解析 -----------------
 def _retry_stream(call_fn, *, max_tries: int, base: float):
-    """
-    对“打开流”的动作做有限重试 + 指数退避。
-    一旦流打开，内部迭代异常不再重启该段（避免重复消耗）。
-    """
     last_err = None
     for i in range(1, max_tries + 1):
         try:
@@ -141,12 +116,10 @@ def _retry_stream(call_fn, *, max_tries: int, base: float):
 def _iter_mmc_events(stream_obj) -> Iterator[Tuple[Optional[str], Optional[dict]]]:
     """
     迭代 DashScope MMC 的流式响应，抽取：
-    - delta_text: 当前增量文本（官方：response["output"]["choices"][0]["message"].content[*].text）
-    - usage:      最近一次拿到的 usage 统计（若返回包含）
-    注意：已开启 incremental_output=True，官方会推送“新增片段”，无需再做前缀差分。
+    - delta_text: 当前增量文本
+    - usage:      最近一次 usage
     """
     usage_cache: Optional[dict] = None
-
     for rsp in stream_obj:
         delta_text: Optional[str] = None
         try:
@@ -155,7 +128,6 @@ def _iter_mmc_events(stream_obj) -> Iterator[Tuple[Optional[str], Optional[dict]
             if choices:
                 msg = (choices[0] or {}).get("message") or {}
                 content = msg.get("content") or []
-                # content 可能混合 image/text，这里把所有 text 片段拼起来
                 parts: List[str] = []
                 for it in content:
                     if isinstance(it, dict):
@@ -164,7 +136,6 @@ def _iter_mmc_events(stream_obj) -> Iterator[Tuple[Optional[str], Optional[dict]
                             parts.append(t)
                 if parts:
                     delta_text = "".join(parts)
-
             u = rsp.get("usage") or {}
             if u:
                 usage_cache = {
@@ -173,15 +144,67 @@ def _iter_mmc_events(stream_obj) -> Iterator[Tuple[Optional[str], Optional[dict]
                     "total_tokens": u.get("total_tokens"),
                 }
         except Exception:
-            # 单个事件解析失败不影响后续
             pass
-
         yield delta_text, usage_cache
 
 
-# ----------------- B 线程主体 -----------------
-def worker_b_vlm(q_video: Queue, q_vlm: Queue, q_ctrl: Queue, stop: object,
-):
+# ----------------- 文本归一化与去重 -----------------
+def _normalize_lines(s: str) -> List[str]:
+    """
+    把模型输出分解成“要点行”，用于和历史小结比对，尽量温和不过度修改原文。
+    """
+    if not s:
+        return []
+    raw_lines = [ln.strip() for ln in s.replace("\r", "").split("\n")]
+    out: List[str] = []
+    for ln in raw_lines:
+        if not ln:
+            continue
+        # 去前缀符号
+        for p in ("- ", "• ", "* ", "· "):
+            if ln.startswith(p):
+                ln = ln[len(p):].strip()
+                break
+        # 合并句末标点空格
+        ln = ln.strip(" \u3000")
+        if ln:
+            out.append(ln)
+    return out
+
+
+def _join_as_bullets(lines: List[str]) -> str:
+    return "\n".join("- " + ln for ln in lines)
+
+
+# ----------------- 历史上下文拼装 -----------------
+def _build_history_context_text(history: List[str], max_chars: int) -> str:
+    """
+    将最近若干段的小结拼成一段“历史小结”文本，用于放进 prompt。
+    控制总体字符数上限（避免上下文过长）。
+    """
+    if not history:
+        return ""
+    # 近→远拼接，超过上限就截断
+    buf = []
+    remain = max_chars
+    for one in reversed(history):
+        if not one:
+            continue
+        t = one.strip()
+        if not t:
+            continue
+        if len(t) + 1 > remain:
+            break
+        buf.append(t)
+        remain -= (len(t) + 1)
+    if not buf:
+        return ""
+    # 用分隔线清晰标记
+    return "以下为“历史小结”（近到远，最多 N 段）：\n" + ("\n---\n".join(buf))
+
+
+# ----------------- B 线程主体（带“只输出新增”能力） -----------------
+def worker_b_vlm(q_video: Queue, q_vlm: Queue, q_ctrl: Queue, stop: object):
     running = False
     paused = False
     max_frames_cap: Optional[int] = None
@@ -191,6 +214,12 @@ def worker_b_vlm(q_video: Queue, q_vlm: Queue, q_ctrl: Queue, stop: object,
     global_user_prompt = os.getenv("VLM_USER_PROMPT", "").strip() or None
     current_mode: Optional[str] = None
     user_prompt: Optional[str] = _resolve_prompt(global_user_prompt, current_mode)
+
+    # 新增：历史记忆&去重配置
+    hist_max_rounds = int(os.getenv("VLM_CONTEXT_MEMORY_N", "30"))  # 记忆最多多少轮
+    hist_max_chars  = int(os.getenv("VLM_CONTEXT_MAX_CHARS", "4000"))  # 放进 prompt 的历史字符上限
+    history_deque: deque[str] = deque(maxlen=max(1, hist_max_rounds))  # 保存“已对外发布”的小结
+    dedup_enabled = os.getenv("VLM_DEDUP_DONE", "1") == "1"  # done 收尾做去重（模型侧已约束，这里再保险）
 
     # 流式重试 & 心跳
     retry_times = int(os.getenv("VLM_STREAM_RETRY_TIMES", "2"))
@@ -209,7 +238,6 @@ def worker_b_vlm(q_video: Queue, q_vlm: Queue, q_ctrl: Queue, stop: object,
         logger.error("[B] DashScope MMC 不可用，将对每个片段直接输出错误收尾。")
 
     def _drain_all_ctrl_nonstop() -> bool:
-        """段落前清空历史控制消息；若遇 STOP 则让线程退出。"""
         stop_flag = False
         while True:
             try:
@@ -222,11 +250,9 @@ def worker_b_vlm(q_video: Queue, q_vlm: Queue, q_ctrl: Queue, stop: object,
             if isinstance(msg, dict) and msg.get("type") in ("STOP", "SHUTDOWN"):
                 stop_flag = True
                 break
-            # 其它控制消息一律丢弃旧的，避免残留影响
         return stop_flag
 
     def _poll_ctrl_heartbeat() -> bool:
-        """流式心跳：仅在 STOP/SHUTDOWN 时中断当前段；其它消息放回队列。"""
         try:
             msg = q_ctrl.get_nowait()
         except Empty:
@@ -235,12 +261,25 @@ def worker_b_vlm(q_video: Queue, q_vlm: Queue, q_ctrl: Queue, stop: object,
             return True
         if isinstance(msg, dict) and msg.get("type") in ("STOP", "SHUTDOWN"):
             return True
-        # 放回队列，不吞
         try:
             q_ctrl.put_nowait(msg)
         except Exception:
             pass
         return False
+
+    # —— 只输出“新增”的系统/用户指令模板（可环境变量覆盖） —
+    system_guardrail = os.getenv(
+        "VLM_CONTEXT_SYSTEM",
+        """仅当新片段出现了“可观察到的新增正向事实（新物体/动作/场景变化/文字/数字/图表/时间地点人物变化等）”时才输出；
+        不要仅以“未发生/没有/未看到”作为新增要点。"""
+    ).strip()
+
+    user_guardrail_prefix = os.getenv(
+        "VLM_CONTEXT_USER_PREFIX",
+        "请在**参考历史小结**的前提下，只输出“历史中未出现的新信息/新细节/新动作/明显变化”。"
+        "如果没有新增，请输出空字符串。输出尽量使用要点列表。"
+        "你的回答格式必须放在一个段落内, 不要出现不同分段或换段落列要点等格式的输出。"
+    ).strip()
 
     try:
         while True:
@@ -336,6 +375,17 @@ def worker_b_vlm(q_video: Queue, q_vlm: Queue, q_ctrl: Queue, stop: object,
                     media_used = img_uris
                     messages = _build_msgs_for_images(img_uris, user_prompt)
 
+                # ===== 新增：附带历史小结到 prompt（从第2段起） =====
+                history_text = _build_history_context_text(list(history_deque), hist_max_chars)
+                if history_text:
+                    # 用 system 提醒“只输出新增”
+                    messages.insert(0, {"role": "system", "content": [{"text": system_guardrail}]})
+                    # 在用户内容末尾再加一段“历史小结+只输出新增”的要求
+                    messages.append({
+                        "role": "user",
+                        "content": [{"text": f"{user_guardrail_prefix}\n\n{history_text}"}]
+                    })
+
                 if not _HAS_MMC:
                     _q_put_with_retry(q_vlm, {
                         "type": "vlm_stream_done",
@@ -347,7 +397,10 @@ def worker_b_vlm(q_video: Queue, q_vlm: Queue, q_ctrl: Queue, stop: object,
                         "media_kind": "unknown",
                         "media_used": [],
                         "origin_policy": policy_used,
-                        "t0": t0, "t1": t1
+                        "t0": t0, "t1": t1,
+                        # 兼容字段
+                        "clip_t0": t0, "clip_t1": t1,
+                        "frame_pts": [], "frame_indices": [],
                     })
                     continue
 
@@ -359,7 +412,6 @@ def worker_b_vlm(q_video: Queue, q_vlm: Queue, q_ctrl: Queue, stop: object,
                 interrupted = False
 
                 def _open_stream():
-                    # api_key 可不显式传入，SDK 会按环境变量规则检索
                     return MultiModalConversation.call(
                         model=model_name,
                         messages=messages,
@@ -375,14 +427,26 @@ def worker_b_vlm(q_video: Queue, q_vlm: Queue, q_ctrl: Queue, stop: object,
                         beat += 1
 
                         if delta:
-                            full_content += delta  # 直接累加（已是增量）
+                            full_content += delta
                             _q_put_with_retry(q_vlm, {
                                 "type": "vlm_stream_delta",
                                 "segment_index": seg_idx,
                                 "delta": delta,
                                 "seq": seq,
                                 "model": model_name,
-                                "media_kind": media_kind or "unknown"
+                                "media_kind": media_kind or "unknown",
+                                # —— 时间/片段辅助信息（与 A 对齐）——
+                                "media_ts": float(t0) + max(0.0, (float(t1) - float(t0)) / 2.0) if t0 is not None and t1 is not None else None,
+                                "media_ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(
+                                    (float(t0) + (float(t1)-float(t0))/2.0) if (t0 is not None and t1 is not None) else time.time()
+                                )),
+                                "clip_t0": t0, "clip_t1": t1,
+                                "frame_pts": item.get("frame_pts") or [],
+                                "frame_indices": item.get("frame_indices") or [],
+                                "small_video_fps": item.get("policy", {}).get("encode", {}).get("fps"),
+                                "origin_policy": policy_used,
+                                "produce_ts": time.time(),
+                                "produce_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
                             })
                             seq += 1
 
@@ -405,39 +469,62 @@ def worker_b_vlm(q_video: Queue, q_vlm: Queue, q_ctrl: Queue, stop: object,
                         "media_kind": media_kind or "unknown",
                         "media_used": media_used,
                         "origin_policy": policy_used,
-                        "t0": t0, "t1": t1
+                        "t0": t0, "t1": t1,
+                        "clip_t0": t0, "clip_t1": t1,
+                        "frame_pts": item.get("frame_pts") or [],
+                        "frame_indices": item.get("frame_indices") or [],
+                        "small_video_fps": item.get("policy", {}).get("encode", {}).get("fps"),
+                        "produce_ts": time.time(),
+                        "produce_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
                     })
                     continue
 
-                # ---- 收尾 ----
+                # ---- 收尾（去重过滤，仅保留新增）----
+                final_text = full_content
+                suppressed = False
+                if dedup_enabled and history_deque:
+                    cur_lines = _normalize_lines(full_content)
+                    hist_lines: List[str] = []
+                    for h in history_deque:
+                        hist_lines.extend(_normalize_lines(h))
+                    hist_set = set(hist_lines)
+                    new_lines = [ln for ln in cur_lines if ln not in hist_set]
+                    final_text = _join_as_bullets(new_lines)
+                    if not final_text.strip():
+                        suppressed = True  # 没有新增
+
+                # 记录用于后续轮的“历史小结”：只纳入对外最终发布的文本
+                if final_text.strip():
+                    history_deque.append(final_text)
+
+                payload_done = {
+                    "type": "vlm_stream_done",
+                    "segment_index": seg_idx,
+                    "full_text": final_text,
+                    "usage": usage,
+                    "model": model_name,
+                    "latency_ms": int((time.time() - t_start) * 1000),
+                    "media_kind": media_kind or "unknown",
+                    "media_used": media_used,
+                    "origin_policy": policy_used,
+                    "t0": t0, "t1": t1,
+                    # 兼容字段与时间辅助
+                    "clip_t0": t0, "clip_t1": t1,
+                    "frame_pts": item.get("frame_pts") or [],
+                    "frame_indices": item.get("frame_indices") or [],
+                    "small_video_fps": item.get("policy", {}).get("encode", {}).get("fps"),
+                    "produce_ts": time.time(),
+                    "produce_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+                    # 新增：上下文信息（可用于调试）
+                    "ctx_rounds": len(history_deque),
+                    "suppressed_dup": bool(suppressed),
+                }
+
+                _q_put_with_retry(q_vlm, payload_done)
+
                 if interrupted:
-                    _q_put_with_retry(q_vlm, {
-                        "type": "vlm_stream_done",
-                        "segment_index": seg_idx,
-                        "full_text": "[CANCELLED_BY_STOP] " + (full_content or ""),
-                        "usage": usage,
-                        "model": model_name,
-                        "latency_ms": int((time.time() - t_start) * 1000),
-                        "media_kind": media_kind or "unknown",
-                        "media_used": media_used,
-                        "origin_policy": policy_used,
-                        "t0": t0, "t1": t1
-                    })
                     logger.info("[B] 已按 STOP 中断当前段落并退出。")
                     return
-                else:
-                    _q_put_with_retry(q_vlm, {
-                        "type": "vlm_stream_done",
-                        "segment_index": seg_idx,
-                        "full_text": full_content,
-                        "usage": usage,
-                        "model": model_name,
-                        "latency_ms": int((time.time() - t_start) * 1000),
-                        "media_kind": media_kind or "unknown",
-                        "media_used": media_used,
-                        "origin_policy": policy_used,
-                        "t0": t0, "t1": t1
-                    })
 
             finally:
                 try:
