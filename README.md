@@ -119,7 +119,8 @@ ctrl = StreamingAnalyze(
     mode=MODEL.ONLINE,   # ONLINE / OFFLINE / SECURITY
     slice_sec=5,
     enable_b=True,       # 开 VLM
-    enable_c=True        # 开 ASR
+    enable_c=True,        # 开 ASR
+    ew_guard_enabled=None #关闭对齐与节流
 )
 
 for ev in ctrl.run_stream(print_vlm=False, print_asr=False, max_secs=60):
@@ -143,7 +144,8 @@ ctrl = StreamingAnalyze(
     mode=MODEL.OFFLINE,
     slice_sec=5,
     enable_b=True,
-    enable_c=True
+    enable_c=True,
+    ew_guard_enabled=None #关闭对齐与节流
 )
 
 result = ctrl.run_and_return(print_vlm=False, print_asr=False)
@@ -166,7 +168,8 @@ StreamingAnalyze(
     mode=MODEL.OFFLINE,
     slice_sec=5,
     enable_b=True,
-    enable_c=True
+    enable_c=True,
+    ew_guard_enabled=None #关闭对齐与节流
 ).run_simple(print_vlm=True, print_asr=True)
 ```
 
@@ -282,7 +285,8 @@ ctrl = StreamingAnalyze(
     mode=MODEL.OFFLINE,
     slice_sec=5,
     enable_b=True,
-    enable_c=True
+    enable_c=True,
+    ew_guard_enabled=None #关闭对齐与节流
 )
 
 for ev in ctrl.run_stream(print_vlm=False, print_asr=False):
