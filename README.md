@@ -192,6 +192,7 @@ StreamingAnalyze(
   `{"type":"vlm_stream_delta","delta":"...","seq":1,"media_kind":"video|images","t0":..,"t1":..,"_meta":{...}}`
 - 收尾：  
   `{"type":"vlm_stream_done","full_text":"...","latency_ms":1234,"media_used":[...],"origin_policy":"...","t0":..,"t1":..,"_meta":{...}}`
+
 **ASR（C）事件（默认句级，仅收尾）：**
 - 句级收尾：  
   `{"type":"asr_stream_done","full_text":"...","latency_ms":1234,"sentence_times":[{"start_ts":..,"end_ts":..}, ...],"t0":..,"t1":..,"_meta":{...}}`
