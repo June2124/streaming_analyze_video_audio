@@ -46,7 +46,7 @@ class StreamingAnalyze:
 
     重要参数:
       - url: 本地文件或 rtsp/rtsps
-      - mode: MODEL.ONLINE / OFFLINE / SECURITY
+      - mode: MODEL.ONLINE / OFFLINE / SECURITY # 离线视频选择OFFLINE、实时流会议直播等场景选择ONLINE、实时流安防摄像头等场景选择SECURITY; 详见work_a_cut.py
       - slice_sec: A 侧切窗秒数
       - enable_b / enable_c: 是否启用 VLM / ASR 分支
 
