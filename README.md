@@ -1,4 +1,32 @@
 # Streaming Analyze (A/B/C) — 端到端音视频流式理解
+# streaming_analyze_video_audio
+
+[![GitHub stars](https://img.shields.io/github/stars/June2124/streaming_analyze_video_audio?style=social)](https://github.com/June2124/streaming_analyze_video_audio/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/June2124/streaming_analyze_video_audio?style=social)](https://github.com/June2124/streaming_analyze_video_audio/network/members)
+[![Issues](https://img.shields.io/github/issues/June2124/streaming_analyze_video_audio)](https://github.com/June2124/streaming_analyze_video_audio/issues)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](#license)
+![Python](https://img.shields.io/badge/Python-3.9%20%7C%203.10%20%7C%203.11-blue)
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-informational)
+![FFmpeg](https://img.shields.io/badge/FFmpeg-required-important)
+![OpenCV](https://img.shields.io/badge/OpenCV-required-informational)
+![DashScope](https://img.shields.io/badge/DashScope-optional-success)
+
+> **一句话简介（也可放到右侧 About）：**  
+> 实时/离线 **多线程** 流式音视频分析框架：A 线程切片标准化 → B 线程 **VLM** 视觉解析（**SSE 增量** + 片尾收尾）→ C 线程 **ASR** 句级转写（VAD 跳过），主控提供 **run_stream** 实时事件总线（VLM 增量 + ASR 段尾）、**run_and_return** 汇总返回，以及对齐/节流守护。
+
+---
+
+## ✨ 关键词（便于搜索/发现）
+流式、实时、离线、增量、句级、VLM、ASR、视频理解、音频转写、FFmpeg、OpenCV、DashScope、SSE、RTSP、关键帧、小视频、对齐、节流、线程、Python
+
+---
+
+## 🚀 快速上手
+```bash
+git clone https://github.com/June2124/streaming_analyze_video_audio.git
+cd streaming_analyze_video_audio
+pip install -r requirements.txt
+# Windows/Mac/Linux 请先安装 FFmpeg 并加入 PATH
 
 > 切片（A）→ 视觉解析（B, VLM）→ 语音转写（C, ASR）  
 > 支持离线文件与实时 RTSP，提供 **同步流式生成器**、**一次性汇总**、与 **自定义回调** 三种使用方式。
