@@ -1,5 +1,4 @@
 # Streaming Analyze (A/B/C) — 端到端音视频流式理解
-# streaming_analyze_video_audio
 
 [![GitHub stars](https://img.shields.io/github/stars/June2124/streaming_analyze_video_audio?style=social)](https://github.com/June2124/streaming_analyze_video_audio/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/June2124/streaming_analyze_video_audio?style=social)](https://github.com/June2124/streaming_analyze_video_audio/network/members)
@@ -11,7 +10,7 @@
 ![OpenCV](https://img.shields.io/badge/OpenCV-required-informational)
 ![DashScope](https://img.shields.io/badge/DashScope-optional-success)
 
-> **一句话简介（也可放到右侧 About）：**  
+> **一句话简介**  
 > 实时/离线 **多线程** 流式音视频分析框架：A 线程切片标准化 → B 线程 **VLM** 视觉解析（**SSE 增量** + 片尾收尾）→ C 线程 **ASR** 句级转写（VAD 跳过），主控提供 **run_stream** 实时事件总线（VLM 增量 + ASR 段尾）、**run_and_return** 汇总返回，以及对齐/节流守护。
 
 ---
@@ -37,7 +36,6 @@ pip install -r requirements.txt
   <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-lightgrey.svg">
 </p>
 
----
 
 ## ✨ 功能亮点
 
@@ -50,11 +48,9 @@ pip install -r requirements.txt
 - **可配置策略**：离线/在线/安防三套关键帧/小视频策略可切换  
 - **稳健收尾**：慢停/快停机制，异常自动广播 STOP
 
----
 
 ## 🧩 体系结构
 
-```
             +---------------------------+
             |   StreamingAnalyze 主控   |
             |  (管控/监控/快慢停/节流)  |
@@ -70,18 +66,16 @@ pip install -r requirements.txt
        v                      |
    [B VLM 解析]          run_stream() 迭代器
    [C ASR 转写]
-```
+
 
 - **A**：切窗 + 标准化，按策略产出“小视频/关键帧（给 B）”与“WAV（给 C）”
 - **B**：视觉模型流式增量（delta）与收尾（done）
 - **C**：ASR 句级收尾（默认；如需字级可改 C 侧策略）
 - **主控**：统一管理线程、控制面消息、STOP 策略、对齐/节流（`TranscriptPlaybackSkewController`）
 
----
 
 ## 📦 目录结构（核心文件）
 
-```
 .
 ├─ streaming_analyze.py          # 主控：A/B/C 管线、三种使用方式、便捷回调
 ├─ run_stream_example.py        # 使用示例
@@ -95,9 +89,6 @@ pip install -r requirements.txt
 │  │  ├─ skew_guard.py          # TranscriptPlaybackSkewController
 │  │  └─ logger_utils.py
 │  └─ all_enum.py               # MODEL / SOURCE_KIND
-```
-
----
 
 ## 🔧 前置依赖
 
@@ -110,8 +101,6 @@ pip install -r requirements.txt
   - 视觉：`pip install dashscope`
   - ASR（Paraformer，可选）：`pip install dashscope`（与上相同）
   - 可选 VAD：`pip install webrtcvad-wheels`（Windows 可用的轮子）
-
----
 
 ## ⚙️ 环境变量（常用）
 
@@ -130,7 +119,7 @@ pip install -r requirements.txt
 
 ---
 
-## 🚀 快速开始
+## 📦开箱即用
 
 ### 1) 边跑边拿：`run_stream()`（推荐）
 
