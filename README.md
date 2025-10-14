@@ -148,7 +148,7 @@ for ev in ctrl.run_stream(print_vlm=False, print_asr=False, max_secs=60):
 
 # 可在任意时刻：
 # ctrl.force_stop("manual stop")
-
+```
 
 ### 2) 一次性返回：`run_and_return()`（离线友好）
 
@@ -172,7 +172,7 @@ result = ctrl.run_and_return(print_vlm=False, print_asr=False)
 #   "asr": {"dones": [...]}
 # }
 print(result)
-
+```
 
 ### 3) 简单打印：`run_simple()`（演示/调试）
 
