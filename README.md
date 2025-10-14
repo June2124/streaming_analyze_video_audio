@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="Streaming Analyze Logo" width="160">
+</p>
+
 # Streaming Analyze Video Audio (A/B/C) — 端到端音视频流式理解
 
 [![GitHub stars](https://img.shields.io/github/stars/June2124/streaming_analyze_video_audio?style=social)](https://github.com/June2124/streaming_analyze_video_audio/stargazers)
