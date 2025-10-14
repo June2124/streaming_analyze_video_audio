@@ -3,7 +3,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/June2124/streaming_analyze_video_audio?style=social)](https://github.com/June2124/streaming_analyze_video_audio/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/June2124/streaming_analyze_video_audio?style=social)](https://github.com/June2124/streaming_analyze_video_audio/network/members)
 [![Issues](https://img.shields.io/github/issues/June2124/streaming_analyze_video_audio)](https://github.com/June2124/streaming_analyze_video_audio/issues)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](#license)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/Python-3.9%20%7C%203.10%20%7C%203.11-blue)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-informational)
 ![FFmpeg](https://img.shields.io/badge/FFmpeg-required-important)
