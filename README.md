@@ -290,7 +290,7 @@ StreamingAnalyze(
 Apache-2.0
 This project is licensed under the Apache License 2.0.
 
-Copyright (c) 2025 <June997>
+Copyright (c) 2025 June997
 
 You may obtain a copy of the License at:
 
