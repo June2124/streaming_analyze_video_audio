@@ -1,8 +1,7 @@
-<p align="center">
-  <img src="logo.png" alt="Streaming Analyze Logo" width="160">
-</p>
-
-# Streaming Analyze Video Audio (A/B/C) — 端到端音视频流式理解
+<h1>
+  Streaming Analyze Video Audio (A/B/C) — 端到端音视频流式理解
+  <img src="logo.png" alt="Streaming Analyze Logo" width="32" style="vertical-align: middle; margin-left: 8px;">
+</h1>
 
 [![GitHub stars](https://img.shields.io/github/stars/June2124/streaming_analyze_video_audio?style=social)](https://github.com/June2124/streaming_analyze_video_audio/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/June2124/streaming_analyze_video_audio?style=social)](https://github.com/June2124/streaming_analyze_video_audio/network/members)
@@ -43,11 +42,15 @@ pip install -r requirements.txt
 
 ## ✨ 功能亮点
 
-- **多模态并行**：视频送 VLM、音频送 ASR，主控统一对齐与节流  
+- **多模态并行**：视频送 VLM、音频送 ASR，主控统一对齐与节流。支持：离线音频、离线无声视频、离线音视频、RTSP实时流。  
 - **三种调用模式**：
   - `run_stream()`：边跑边拿 **原始事件**（推荐）
   - `run_and_return()`：任务完成后一次性返回结果（离线友好）
   - **自定义回调**：接入你自己的 UI/消息总线
+- **切片与取帧策略**  
+按模式把原始流切成短窗（SECURITY/ONLINE 短窗、OFFLINE 稍长且可重叠），每窗先做轻量运动检测：**无显著运动→固定等分抽帧**，**有显著运动→按间隔关键帧**；仅 **OFFLINE** 在显著运动时尝试产出“小视频”。
+- **稳健兜底**  
+抽帧优先用 **OpenCV**，失败自动切换 **FFmpeg** 抓帧；若小视频压缩失败，也会回落到关键帧/固定抽帧，尽量保证每段都有可供 VLM 消费的可视输入。
 - **时间对齐**：事件携带 `_meta.emit_ts/emit_iso` 与媒体时间 `t0/t1`，便于拼接上下文  
 - **可配置策略**：离线/在线/安防三套关键帧/小视频策略可切换  
 - **稳健收尾**：慢停/快停机制，异常自动广播 STOP

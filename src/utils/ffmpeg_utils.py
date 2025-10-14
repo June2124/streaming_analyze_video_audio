@@ -1,7 +1,7 @@
 '''
 Author: 13594053100@163.com
 Date: 2025-09-30 09:46:18
-LastEditTime: 2025-10-11 15:57:04
+LastEditTime: 2025-10-14 14:54:35
 '''
 
 # -*- coding: utf-8 -*-
@@ -39,9 +39,9 @@ class FFmpegUtils:
     @staticmethod
     def ensure_ffmpeg():
         if not shutil.which("ffmpeg"):
-            raise RuntimeError("ffmpeg 未在 PATH 中找到")
+            raise RuntimeError("[FFmpeg] ffmpeg 未在 PATH 中找到")
         if not shutil.which("ffprobe"):
-            raise RuntimeError("ffprobe 未在 PATH 中找到")
+            raise RuntimeError("[FFmpeg] ffprobe 未在 PATH 中找到")
 
     @staticmethod
     def _normalize_path(url_or_path: str) -> str:
@@ -88,7 +88,7 @@ class FFmpegUtils:
                 return None
             return max(0.0, float(dur))
         except Exception as e:
-            logger.debug(f"ffprobe 获取时长失败: {e}")
+            logger.debug(f"[FFmpeg] ffprobe 获取时长失败: {e}")
             return None
 
     # ========= 时长获取（对外 API） =========
@@ -114,7 +114,7 @@ class FFmpegUtils:
             streams = j.get("streams", [])
             return len(streams) > 0
         except Exception as e:
-            logger.debug(f"ffprobe 检测音轨失败: {e}")
+            logger.debug(f"[FFmpeg] ffprobe 检测音轨失败: {e}")
             return False
 
     # ========= 标准化 =========
@@ -179,7 +179,7 @@ class FFmpegUtils:
         subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         return out_video
 
-    # ========= 切窗并标准化（按源轨道分别处理，无 temp.mp4）=========
+    # ========= 切窗并标准化（按源轨道分别处理，无 temp.mp4；包含“打不开自动重切重编码”的容错）=========
     @staticmethod
     def cut_and_standardize_segment(
         src_url: str, start_time: float, duration: float,
@@ -191,8 +191,30 @@ class FFmpegUtils:
         - 若有音频：16kHz 单声道 wav（audio_path）
         纯音频 → 仅返回 audio_path（video_path=None）
         纯视频 → 仅返回 video_path（audio_path=None）
+
+        容错：
+        1) 先用“流拷贝”快速切，写完立即用 OpenCV 校验能否读取；
+        2) 若打不开/0帧，自动回退“重编码”切片（H.264 固定 GOP/关键帧），确保可读。
         """
-        import json, subprocess, os
+        import json, subprocess, os, cv2
+
+        def _verify_openable(p: str) -> bool:
+            try:
+                cap = cv2.VideoCapture(p)
+                if not cap.isOpened():
+                    cap.release()
+                    return False
+                # 方式A：总帧数
+                total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                if total <= 0:
+                    # 方式B：尝试读一帧
+                    ok, _ = cap.read()
+                    cap.release()
+                    return bool(ok)
+                cap.release()
+                return True
+            except Exception:
+                return False
 
         FFmpegUtils.ensure_ffmpeg()
         os.makedirs(output_dir, exist_ok=True)
@@ -201,7 +223,7 @@ class FFmpegUtils:
         v_out = os.path.join(output_dir, f"segment_{segment_index:04d}_video.mp4")
         a_out = os.path.join(output_dir, f"segment_{segment_index:04d}_audio.wav")
 
-        # 先探测实际是否存在音/视频流（不要依赖上层 have_audio）
+        # 探测实际存在的音/视频流（不要只信 have_audio）
         def _has_stream(kind: str) -> bool:
             # kind: 'v' or 'a'
             cmd = [
@@ -221,28 +243,72 @@ class FFmpegUtils:
         has_video = _has_stream("v")
         has_audio_real = _has_stream("a")
 
-        # 统一的切片前缀
-        base = ["-ss", str(start_time), "-t", str(duration), "-i", FFmpegUtils._normalize_path(src_url)]
+        # 通用入参
+        src_norm = FFmpegUtils._normalize_path(src_url)
 
-        # 实际导出：分别走各自的命令；无中间文件
         v_path_ret: Optional[str] = None
         a_path_ret: Optional[str] = None
 
-        # ---- 导视频（仅当真的有视频）----
+        # ------------- 先切视频（若真的有视频）-------------
         if has_video:
-            cmd_v = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"] + base + [
-                "-map", "v:0", "-an", "-c:v", "copy", v_out
+            # 尝试 1：流拷贝（快）
+            cmd_v_fast = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", str(start_time), "-t", str(duration), "-i", src_norm,
+                "-map", "v:0", "-an",
+                # 关键参数：尽量保证时间戳完整
+                "-fflags", "+genpts",
+                "-avoid_negative_ts", "make_zero",
+                "-movflags", "+faststart",
+                "-c:v", "copy",
+                v_out
             ]
-            subprocess.check_call(cmd_v)
+            try:
+                subprocess.check_call(cmd_v_fast)
+            except subprocess.CalledProcessError:
+                logger.warning('[FFmpeg] 流拷贝切分失败, 回落到重编码切分。')
+                # 流拷贝失败，直接走重编码
+                cmd_v_slow = [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-i", src_norm, "-ss", str(start_time), "-t", str(duration),
+                    "-map", "v:0", "-an",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                    "-g", "16", "-keyint_min", "16", "-sc_threshold", "0",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    v_out
+                ]
+                subprocess.check_call(cmd_v_slow)
+            else:
+                # 流拷贝写成功，但不代表可读，验证一遍
+                if not _verify_openable(v_out):
+                    # 回退：删除坏文件，重切重编码
+                    logger.warning('[FFmpeg] 流拷贝切片视频文件无法被OpenCV打开, 删除坏文件, 回落到重编码切分。')
+                    try:
+                        os.remove(v_out)
+                    except Exception:
+                        pass
+                    cmd_v_slow = [
+                        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                        "-i", src_norm, "-ss", str(start_time), "-t", str(duration),
+                        "-map", "v:0", "-an",
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                        "-g", "16", "-keyint_min", "16", "-sc_threshold", "0",
+                        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                        v_out
+                    ]
+                    subprocess.check_call(cmd_v_slow)
+
             v_path_ret = v_out
         else:
             v_path_ret = None
 
-        # ---- 导音频（仅当真的有音频）----
+        # ------------- 再切音频（若真的有音频）-------------
         if has_audio_real:
-            # 直接标准化成 16k/mono PCM16
-            cmd_a = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"] + base + [
-                "-map", "a:0", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", a_out
+            cmd_a = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", str(start_time), "-t", str(duration), "-i", src_norm,
+                "-map", "a:0", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+                a_out
             ]
             subprocess.check_call(cmd_a)
             a_path_ret = a_out
@@ -287,7 +353,7 @@ class FFmpegUtils:
         logger.info(f"开始流式切窗: {src_url}, 窗口={slice_sec}s")
         while True:
             if max_duration is not None and t0 >= max_duration:
-                logger.info(f"已到达文件末尾，总时长 {max_duration:.2f}s，结束切窗。")
+                logger.info(f"[FFmpeg] 已到达文件末尾，总时长 {max_duration:.2f}s，结束切窗。")
                 break
 
             # 这里不再依赖 have_audio；由下游函数自检轨道并按实际产出
@@ -301,7 +367,7 @@ class FFmpegUtils:
             has_v = bool(seg.get("video_path"))
             has_a = bool(seg.get("audio_path"))
             logger.debug(
-                "切片完成 seg#%04d t0=%.3f t1=%.3f 产出: video=%s audio=%s",
+                "[FFmpeg] 切片完成 seg#%04d t0=%.3f t1=%.3f 产出: video=%s audio=%s",
                 seg_idx, seg["t0"], seg["t1"],
                 "yes" if has_v else "no",
                 "yes" if has_a else "no",

@@ -73,7 +73,7 @@ class StreamingAnalyze:
         self,
         url: str,
         mode: MODEL,
-        slice_sec: int,
+        slice_sec: Optional[int] = None, # SECURITY模式建议 4~8s; ONLINE模式建议 5~10s；OFFLINE模式建议: 8~12s
         *,
         enable_b: bool = True,
         enable_c: bool = True,
@@ -81,15 +81,28 @@ class StreamingAnalyze:
     ):
         if not isinstance(mode, MODEL):
             raise ValueError(f"mode 只接受 MODEL 枚举，但传入了 {type(mode)}")
-        if not isinstance(slice_sec, int) or not (0 < slice_sec < 3600):
-            raise ValueError("切窗参数必须是 (0, 3600) 之间的正整数")
-
+        
         _check_url_legal(url)
         FFmpegUtils.ensure_ffmpeg()
 
+        # 按模式给默认窗口（秒）
+        default_slice = {
+            MODEL.ONLINE: 6,
+            MODEL.SECURITY: 6,
+            MODEL.OFFLINE: 10,
+        }[mode]
+
+        if slice_sec is None:
+            slice_val = default_slice # 不显示传参, 则按照工作模式, 给出系统默认值
+        else:
+            if not isinstance(slice_sec, int) or not (0 < slice_sec < 5*60):
+                raise ValueError("切窗参数必须是 (4, 30) 之间的正整数(单位s); 注意: slice_sec参数与首帧响应时间、CPU消耗正相关, Token消耗负相关。")
+            slice_val = slice_sec 
+
+
         self.url = url
         self.mode = mode
-        self.slice_sec = slice_sec
+        self.slice_sec = slice_val # 同一写回
         self._source_kind = _determine_source_kind(url)
         self._have_audio_track = FFmpegUtils.have_audio_track(url)
 
@@ -518,7 +531,7 @@ class StreamingAnalyze:
                     with self._stats_lock:
                         self._stats["vlm"]["deltas"] += 1
                     self._last_vlm_emit_ts = now
-                    # ✅ VLM: 增量也发到对外事件总线（原样）
+                    # VLM: 增量也发到对外事件总线（原样）
                     self._emit_to_event_bus(item, channel="vlm")
 
             elif item.get("type") == "vlm_stream_done":
@@ -535,7 +548,7 @@ class StreamingAnalyze:
                     if lat > self._stats["vlm"]["latency_ms_max"]:
                         self._stats["vlm"]["latency_ms_max"] = lat
                 self._last_vlm_emit_ts = now
-                # ✅ VLM: done 也发到对外事件总线（原样）
+                # VLM: done 也发到对外事件总线（原样）
                 self._emit_to_event_bus(item, channel="vlm")
 
             else:
