@@ -1,4 +1,4 @@
-# Streaming Analyze (A/B/C) — 端到端音视频流式理解
+# Streaming Analyze Video Audio (A/B/C) — 端到端音视频流式理解
 
 [![GitHub stars](https://img.shields.io/github/stars/June2124/streaming_analyze_video_audio?style=social)](https://github.com/June2124/streaming_analyze_video_audio/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/June2124/streaming_analyze_video_audio?style=social)](https://github.com/June2124/streaming_analyze_video_audio/network/members)
@@ -10,12 +10,12 @@
 ![OpenCV](https://img.shields.io/badge/OpenCV-required-informational)
 ![DashScope](https://img.shields.io/badge/DashScope-optional-success)
 
-> **一句话简介**  
+> **系统概述**  
 > 实时/离线 **多线程** 流式音视频分析框架：A 线程切片标准化 → B 线程 **VLM** 视觉解析（**SSE 增量** + 片尾收尾）→ C 线程 **ASR** 句级转写（VAD 跳过），主控提供 **run_stream** 实时事件总线（VLM 增量 + ASR 段尾）、**run_and_return** 汇总返回，以及对齐/节流守护。
 
 ---
 
-## ✨ 关键词（便于搜索/发现）
+## ✨ 关键词
 流式、实时、离线、增量、句级、VLM、ASR、视频理解、音频转写、FFmpeg、OpenCV、DashScope、SSE、RTSP、关键帧、小视频、对齐、节流、线程、Python
 
 ---
@@ -117,7 +117,7 @@ pip install -r requirements.txt
 | `EMIT_MAX_SKEW_S` | 跨通道最大视觉领先 | `3.0` |
 | `EMIT_RATE_LIMIT_HZ` | 消费限速（Hz） | `8.0` |
 
----
+```
 
 ## 📦开箱即用
 
@@ -148,7 +148,7 @@ for ev in ctrl.run_stream(print_vlm=False, print_asr=False, max_secs=60):
 
 # 可在任意时刻：
 # ctrl.force_stop("manual stop")
-```
+
 
 ### 2) 一次性返回：`run_and_return()`（离线友好）
 
@@ -172,7 +172,7 @@ result = ctrl.run_and_return(print_vlm=False, print_asr=False)
 #   "asr": {"dones": [...]}
 # }
 print(result)
-```
+
 
 ### 3) 简单打印：`run_simple()`（演示/调试）
 
