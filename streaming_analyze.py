@@ -95,14 +95,14 @@ class StreamingAnalyze:
         if slice_sec is None:
             slice_val = default_slice # 不显示传参, 则按照工作模式, 给出系统默认值
         else:
-            if not isinstance(slice_sec, int) or not (0 < slice_sec < 5*60):
+            if not isinstance(slice_sec, int) or not (0 < slice_sec < 30):
                 raise ValueError("切窗参数必须是 (4, 30) 之间的正整数(单位s); 注意: slice_sec参数与首帧响应时间、CPU消耗正相关, Token消耗负相关。")
             slice_val = slice_sec 
 
 
         self.url = url
         self.mode = mode
-        self.slice_sec = slice_val # 同一写回
+        self.slice_sec = slice_val # 统一写回
         self._source_kind = _determine_source_kind(url)
         self._have_audio_track = FFmpegUtils.have_audio_track(url)
 
