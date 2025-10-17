@@ -26,6 +26,4 @@ class PROMPT_TYPE:
     """
     根据应用场景内置的提示词模板
     """
-    
-
     pass
