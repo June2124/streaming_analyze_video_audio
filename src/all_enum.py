@@ -1,7 +1,7 @@
 '''
 Author: 13594053100@163.com
 Date: 2025-10-08 08:41:48
-LastEditTime: 2025-10-13 16:21:06
+LastEditTime: 2025-10-17 14:35:22
 '''
 '''
 Author: 13594053100@163.com
@@ -22,4 +22,10 @@ class SOURCE_KIND(Enum):
     # 实时流
     RTSP = "rtsp"
     
+class PROMPT_TYPE:
+    """
+    根据应用场景内置的提示词模板
+    """
+    
 
+    pass
