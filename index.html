@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>JetLinksAI · 视频/音频分析 RTSP安防</title>
+<style>
+  :root { --bg:#0b1116; --panel:#0f1720; --muted:#6b7280; --ok:#16a34a; --warn:#d97706; --err:#dc2626; --acc:#3b82f6; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:#e5e7eb; font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,"PingFang SC","Microsoft YaHei",sans-serif; }
+  header { padding:16px 20px; border-bottom:1px solid #111827; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  header h1 { margin:0; font-size:16px; font-weight:600; }
+  main { display:grid; grid-template-columns: 380px 1fr; gap:16px; padding:16px; }
+  .card { background:var(--panel); border:1px solid #111827; border-radius:12px; padding:12px; }
+  .card h2 { margin:0 0 10px; font-size:14px; font-weight:600; color:#cbd5e1; }
+  .row { display:flex; gap:8px; align-items:center; margin:8px 0; }
+  .row > label { min-width:120px; color:#cbd5e1; }
+  input[type="text"], input[type="number"], select {
+    width:100%; padding:8px 10px; color:#e5e7eb; background:#0b1220; border:1px solid #172033; border-radius:8px;
+  }
+  input[type="file"] { width:100%; }
+  button { padding:8px 12px; border:none; border-radius:8px; background:var(--acc); color:white; cursor:pointer; font-weight:600; }
+  button.secondary { background:#1f2937; color:#d1d5db; }
+  button:disabled { opacity:.6; cursor:not-allowed; }
+  .muted { color:var(--muted); }
+  .ok { color:#86efac; } .err { color:#fca5a5; }
+  .pill { padding:4px 8px; border-radius:999px; background:#0b1220; border:1px solid #172033; color:#9ca3af; }
+  .hr { height:1px; background:#111827; margin:10px 0; }
+
+  /* 右半区布局：上方播放器 + 下方三栏事件区 */
+  .right-grid { display:grid; grid-template-rows: 260px 1fr; gap:12px; }
+  .player { background:#0b1220; border:1px solid #172033; border-radius:10px; padding:10px; display:grid; grid-template-columns: 320px 1fr; gap:12px; }
+  .player video { width:100%; border-radius:8px; background:black; }
+  .player .note { font-size:13px; color:#9ca3af; }
+  .events-grid { display:grid; grid-template-columns: 1fr 1fr 1.2fr; gap:12px; }
+  .col h3 { margin:0 0 8px; font-size:13px; color:#cbd5e1; font-weight:600; }
+  .log { height:52vh; overflow:auto; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace; background:#0b1220; border:1px solid #172033; border-radius:10px; padding:10px; }
+  .line { display:flex; gap:8px; padding:6px 8px; border-bottom:1px dashed #0e1624; align-items:flex-start; }
+  .line:last-child { border-bottom:none; }
+  .badge { display:inline-flex; align-items:center; gap:6px; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:700; }
+  .t-asr { background:rgba(22,163,74,.12); color:#86efac; border:1px solid rgba(22,163,74,.35); }
+  .t-vlm-done { background:rgba(217,119,6,.12); color:#fde68a; border:1px solid rgba(217,119,6,.35); }
+  .t-sys { background:#111827; color:#9ca3af; border:1px solid #1f2937; }
+  .seg { color:#94a3b8; font-weight:600; }
+  .ts { color:#64748b; font-size:12px; margin-left:auto; }
+  .event-card { border:1px solid #273244; background:#0c1320; border-radius:8px; padding:10px; margin:8px 0; display:grid; grid-template-columns: 1fr 180px; gap:10px; }
+
+  /* 证据帧缩略图 */
+  .evidence-wrap { display:flex; align-items:center; justify-content:center; }
+  .evidence-wrap a { display:block; width:100%; }
+  .evidence-wrap img { width:100%; max-height:140px; object-fit:cover; border-radius:6px; border:1px solid #172033; }
+
+  /* 等级徽标与结构 */
+  .badge-lvl { padding:2px 8px; border-radius:999px; font-size:12px; font-weight:700; border:1px solid transparent; }
+  .lvl-normal { background:rgba(59,130,246,.12); color:#93c5fd; border-color:rgba(59,130,246,.35); }   /* 正常(蓝) */
+  .lvl-low    { background:rgba(139,92,246,.12); color:#c4b5fd; border-color:rgba(139,92,246,.35); }   /* 低(紫) */
+  .lvl-med    { background:rgba(217,119,6,.12);  color:#fdba74; border-color:rgba(217,119,6,.35); }    /* 中(橙) */
+  .lvl-high   { background:rgba(239,68,68,.12);  color:#fca5a5; border-color:rgba(239,68,68,.35); }    /* 高(红) */
+  .lvl-crit   { background:rgba(153,27,27,.18);  color:#fecaca; border-color:rgba(153,27,27,.45); }    /* 严重(深红) */
+
+  .event-head { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
+  .event-meta { margin-left:auto; font-size:12px; color:#94a3b8; display:flex; gap:10px; }
+  .event-desc { font-size:14px; color:#e5e7eb; line-height:1.5; }
+  .event-sugg { margin-top:6px; font-size:13px; color:#cbd5e1; }
+
+  /* 中间栏（打字机）行样式 */
+  .delta-line { padding:4px 2px; border-bottom:1px dashed #112033; white-space:pre-wrap; word-break:break-all; }
+</style>
+</head>
+<body>
+<header>
+  <h1>JetLinksAI 视频/音频分析 RTSP安防</h1>
+  <span class="pill">SSE 实时事件（筛选）</span>
+  <span class="pill">语音转录· 视觉理解· RTSP安防检测</span>
+</header>
+
+<main>
+  <!-- 左侧控制栏 -->
+  <section class="card">
+    <h2>离线文件（上传即分析）</h2>
+    <form id="formUpload">
+      <div class="row"><label>选择文件</label><input type="file" id="file" name="file" accept="video/*,audio/*" required /></div>
+      <div class="row"><label>切片秒数</label><input type="number" id="slice_sec_up" name="slice_sec" value="5" min="2" max="30" /></div>
+      <div class="row"><label>VLM 提示词</label><input type="text" id="vlm_prompt" name="vlm_system_prompt" value="请描述画面内容，突出重点" /></div>
+      <div class="row">
+        <label>VLM 流式</label>
+        <select id="vlm_streaming" name="vlm_streaming">
+          <option value="true" selected>开启（推荐）</option>
+          <option value="false">关闭</option>
+        </select>
+      </div>
+      <div class="row">
+        <label>采样方法</label>
+        <select id="cut_diff_method" name="cut_diff_method">
+          <option value="bgr_ratio" selected>BGR_RATIO</option>
+          <option value="gray_mean">GRAY_MEAN</option>
+          <option value="hist">HIST</option>
+          <option value="flow">FLOW</option>
+        </select>
+      </div>
+      <div class="row"><label>候选间隔(s)</label><input type="number" step="0.1" id="cut_interval_sec" name="cut_interval_sec" value="1.0" /></div>
+      <div class="row"><label>变化阈值</label><input type="number" step="0.01" id="cut_diff_threshold" name="cut_diff_threshold" value="0.5" /></div>
+      <div class="row" style="gap:8px;align-items:center;">
+        <button type="submit" id="btnUpload">上传并开始</button>
+        <span class="muted">成功后自动订阅 SSE，并在右侧播放所选文件。</span>
+      </div>
+    </form>
+
+    <div class="hr"></div>
+
+    <h2>RTSP 实时流（先选 Preset 再填地址）</h2>
+    <form id="formRtsp">
+      <div class="row">
+        <label>内置提示词 Preset</label>
+        <select id="vlm_preset" required>
+          <option value="" disabled selected>请选择一个任务 Preset</option>
+          <option value="FACTORY_SECURITY">工厂安防</option>
+          <option value="RESIDENTIAL_SECURITY">小区安防</option>
+          <option value="OFFICE_PRODUCTIVITY_COMPLIANT">办公区秩序/占用（合规）</option>
+          <option value="CONSTRUCTION_PPE">施工现场 PPE/三违</option>
+          <option value="RETAIL_LOSS_PREVENTION">零售门店 防损/陈列</option>
+          <option value="TRAFFIC_INTERSECTION">交通路口 态势</option>
+          <option value="WAREHOUSE_SAFETY">仓储作业 安全/效率</option>
+          <option value="LAB_DATACENTER_SAFETY">实验室/机房 安全</option>
+          <option value="MANUFACTURING_QA">生产线 外观质检/工位异常</option>
+          <option value="HEALTHCARE_PUBLIC_SAFETY">医疗/养老 公区安全</option>
+        </select>
+      </div>
+      <div class="row"><label>RTSP 地址</label><input type="text" id="rtsp_url" placeholder="rtsp://user:pwd@ip:port/..." required /></div>
+      <div class="row"><label>切片秒数</label><input type="number" id="slice_sec_rtsp" value="4" min="1" max="12" /></div>
+      <div class="row"><label>候选间隔(s)</label><input type="number" step="0.1" id="rtsp_interval" value="2.0" /></div>
+      <div class="row"><label>变化阈值</label><input type="number" step="0.01" id="rtsp_threshold" value="0.55" /></div>
+      <div class="row">
+        <label>最小事件等级</label>
+        <select id="event_min_level">
+          <option value="LOW" selected>LOW（含）以上</option>
+          <option value="MEDIUM">MEDIUM（含）以上</option>
+          <option value="HIGH">HIGH（含）以上</option>
+          <option value="CRITICAL">CRITICAL（仅严重）</option>
+        </select>
+      </div>
+      <div class="row">
+        <label>本地打开流</label>
+        <select id="open_local_player">
+          <option value="true" selected>是（ffplay/vlc）</option>
+          <option value="false">否</option>
+        </select>
+      </div>
+      <div class="row" style="gap:8px;align-items:center;">
+        <button type="submit" id="btnRtsp">开始 RTSP</button>
+        <span class="muted">后端按 Preset 非流式解析，并尝试本地播放器演示。</span>
+      </div>
+    </form>
+
+    <div class="hr"></div>
+
+    <h2>停止当前任务</h2>
+    <div class="row" style="gap:8px;">
+      <button type="button" class="secondary" id="btnStop">停止</button>
+      <button type="button" class="secondary" id="btnClear">清空日志</button>
+    </div>
+    <div class="muted" id="status"></div>
+  </section>
+
+  <!-- 右侧展示区 -->
+  <section class="right-grid">
+    <!-- 播放器区 -->
+    <div class="player">
+      <div><video id="player" controls muted playsinline></video></div>
+      <div class="note" id="playerNote">
+        左侧上传离线文件后将在此预览；RTSP 无法在浏览器播放，将由服务端尝试在本地播放器（ffplay/vlc）打开。
+      </div>
+    </div>
+
+    <!-- 三栏事件区 -->
+    <div class="events-grid">
+      <div class="card col">
+        <h3>语音转录</h3>
+        <div id="warnAsr" class="mini-warn"></div>
+        <div id="logAsr" class="log"></div>
+      </div>
+      <div class="card col">
+        <h3>视觉理解</h3>
+        <div id="warnDelta" class="mini-warn"></div>
+        <div id="logDelta" class="log"></div>
+      </div>
+      <div class="card col">
+        <h3>RTSP安防检测</h3>
+        <div id="warnRtsp" class="mini-warn"></div>
+        <div id="logRtsp" class="log"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+(() => {
+  const $ = (s, p=document) => p.querySelector(s);
+
+  // DOM 引用
+  const statusEl = $("#status");
+  const player = $("#player");
+  const playerNote = $("#playerNote");
+
+  const logAsr = $("#logAsr");
+  const logDelta = $("#logDelta");
+  const logRtsp = $("#logRtsp");
+  const warnAsr = $("#warnAsr");
+  const warnDelta = $("#warnDelta");
+  const warnRtsp = $("#warnRtsp");
+
+  let es = null; // EventSource
+
+  // ========== 工具 ==========
+  function setStatus(msg, ok=true){ statusEl.innerHTML = ok ? `<span class="ok">✅ ${msg}</span>` : `<span class="err">❌ ${msg}</span>`; }
+  function tsText(ts){ try { return ts ? new Date(ts).toISOString() : new Date().toISOString(); } catch { return new Date().toISOString(); } }
+
+  // ASR / 提示行
+  function addLine(container, badgeText, badgeClass, text, seg, t0, t1, ts){
+    const wrap = document.createElement("div"); wrap.className = "line";
+    const badge = document.createElement("span"); badge.className = `badge ${badgeClass}`; badge.textContent = badgeText;
+    const segEl = document.createElement("span"); segEl.className="seg"; segEl.textContent = (seg!=null?`#${seg}`:"#-");
+    const range = (t0!=null && t1!=null) ? `  [${Number(t0).toFixed(2)}s ~ ${Number(t1).toFixed(2)}s]` : "";
+    const txt = document.createElement("div"); txt.style.whiteSpace="pre-wrap"; txt.style.flex="1"; txt.textContent = text||"";
+    const tsEl = document.createElement("span"); tsEl.className="ts"; tsEl.textContent = tsText(ts);
+    wrap.appendChild(badge); wrap.appendChild(segEl);
+    if (range) { const r = document.createElement("span"); r.className="muted"; r.textContent = range; wrap.appendChild(r); }
+    wrap.appendChild(txt); wrap.appendChild(tsEl);
+    container.appendChild(wrap); container.scrollTop = container.scrollHeight;
+  }
+  function clearWarn(el){ el.style.display="none"; el.textContent=""; }
+  function showWarn(el, msg){ el.style.display="block"; el.textContent = msg; }
+
+  // ========= 中间栏：打字机渲染 (消费“非 JSON”的 vlm_done.full_text) =========
+  const TYPEWRITER_SPEED_MS = 18;   // 每个字符的间隔
+  const DELTA_LINE_LEN = 30;        // 每行 30 字符
+  const deltaQueue = [];
+  let typing = false;
+
+  function normalizeWhitespace(s){
+    return String(s)
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .replace(/\t/g, "    ");
+  }
+
+  function enqueueDelta(textRaw){
+    const text = normalizeWhitespace(textRaw ?? "");
+    if (!text) return;
+    deltaQueue.push(text);
+    if (!typing) processDeltaQueue();
+  }
+
+  function processDeltaQueue(){
+    if (deltaQueue.length === 0) { typing = false; return; }
+    typing = true;
+    const text = deltaQueue.shift();
+    typewriteDelta(text, () => processDeltaQueue());
+  }
+
+  function typewriteDelta(text, onDone){
+    clearWarn(warnDelta);
+    let i = 0, col = 0;
+    let lineEl = createDeltaLine();
+
+    const timer = setInterval(() => {
+      if (i >= text.length) {
+        clearInterval(timer);
+        if (typeof onDone === "function") onDone();
+        return;
+      }
+      const ch = text[i++];
+
+      if (ch === "\n") {
+        lineEl = createDeltaLine();
+        col = 0;
+        return;
+      }
+
+      lineEl.textContent += ch;
+      col++;
+
+      if (col >= DELTA_LINE_LEN) {
+        lineEl = createDeltaLine();
+        col = 0;
+      }
+
+      logDelta.scrollTop = logDelta.scrollHeight;
+    }, TYPEWRITER_SPEED_MS);
+  }
+
+  function createDeltaLine(){
+    const el = document.createElement("div");
+    el.className = "delta-line";
+    logDelta.appendChild(el);
+    return el;
+  }
+
+  // ========= 右栏：RTSP 时间轴（解析 full_text JSON 数组 + 证据帧） =========
+  function addRtspTimeline(fullText, seg, t0, t1, ts, evidenceUrl){
+    clearWarn(warnRtsp);
+
+    // 尝试解析为 JSON 数组；若失败，交给中栏打字机展示
+    let arr;
+    try {
+      arr = JSON.parse(fullText);
+      if (!Array.isArray(arr)) throw new Error("not array");
+    } catch {
+      enqueueDelta(fullText || "");
+      return;
+    }
+
+    const timeLabel = `[${(t0??0).toFixed?.(2)||t0}s ~ ${(t1??0).toFixed?.(2)||t1}s]`;
+    const nowIso = tsText(ts);
+
+    const levelMap = {
+      LOW:      { txt: "低风险",   cls: "lvl-low"  },
+      MEDIUM:   { txt: "中风险",   cls: "lvl-med"  },
+      HIGH:     { txt: "高风险",   cls: "lvl-high" },
+      CRITICAL: { txt: "严重",     cls: "lvl-crit" },
+    };
+    const fmtPct = (v) => {
+      const n = Number(v);
+      if (!isFinite(n)) return "—";
+      const pct = Math.max(0, Math.min(1, n)) * 100;
+      return `${Math.round(pct)}%`;
+    };
+
+    const block = document.createElement("div");
+    block.className = "event-card";
+
+    // 左侧内容容器（描述/建议）
+    const left = document.createElement("div");
+
+    // 头部
+    const head = document.createElement("div");
+    head.className = "event-head";
+    head.innerHTML = `<span class="badge t-vlm-done">VLM ✓</span><span class="seg">#${seg ?? "-"}</span>`;
+    const meta = document.createElement("div");
+    meta.className = "event-meta";
+    meta.innerHTML = `<span>${timeLabel}</span><span>${nowIso}</span>`;
+    head.appendChild(meta);
+    left.appendChild(head);
+
+    // —— 规则渲染 —— 
+    if (arr.length === 0) {
+      const row = document.createElement("div");
+      row.className = "event-desc";
+      row.innerHTML = `当前巡检无异常 <span class="badge-lvl lvl-normal">正常</span>`;
+      left.appendChild(row);
+    } else {
+      arr.forEach((it) => {
+        if (!it || typeof it !== "object") return;
+        const { describe, level, suggestion, confidence } = it;
+
+        const lv = levelMap[String(level).toUpperCase()] || levelMap.MEDIUM;
+        const desc = document.createElement("div");
+        desc.className = "event-desc";
+        desc.innerHTML =
+          `${describe ? String(describe) : "检测到异常"} ` +
+          `<span class="badge-lvl ${lv.cls}">${lv.txt}</span>` +
+          `<span class="event-meta" style="gap:12px;margin-left:8px;">` +
+            `<span>AI置信度 ${fmtPct(confidence)}</span>` +
+          `</span>`;
+        left.appendChild(desc);
+
+        if (suggestion) {
+          const sug = document.createElement("div");
+          sug.className = "event-sugg";
+          sug.textContent = `建议：${String(suggestion)}`;
+          left.appendChild(sug);
+        }
+      });
+    }
+
+    block.appendChild(left);
+
+    // 右侧证据帧（若有）
+    const right = document.createElement("div");
+    right.className = "evidence-wrap";
+    if (evidenceUrl) {
+      right.innerHTML = `<a href="${evidenceUrl}" target="_blank" rel="noopener">
+        <img src="${evidenceUrl}" alt="evidence">
+      </a>`;
+    } else {
+      right.innerHTML = `<div class="muted" style="font-size:12px;text-align:center;">无证据帧</div>`;
+    }
+    block.appendChild(right);
+
+    logRtsp.appendChild(block);
+    logRtsp.scrollTop = logRtsp.scrollHeight;
+  }
+
+  // ========== SSE ==========
+  function connectSSE(jobId){
+    if (es) { es.close(); es = null; }
+    const url = jobId ? `/events?job_id=${encodeURIComponent(jobId)}` : `/events`;
+    es = new EventSource(url);
+
+    es.onmessage = (e) => {
+      let data; try { data = JSON.parse(e.data); } catch { return; }
+
+      if (data.type === "asr_done") {
+        clearWarn(warnAsr);
+        addLine(logAsr, "ASR", "t-asr", data.text, data.seg, data.t0, data.t1, data.ts);
+      } else if (data.type === "vlm_done") {
+        // 统一入口：优先按 RTSP JSON 渲染，否则按离线文本渲染
+        const evidenceUrl = data.evidence_image_url || null;
+        addRtspTimeline(data.text, data.seg, data.t0, data.t1, data.ts, evidenceUrl);
+      }
+    };
+
+    es.addEventListener("hello", (e) => {
+      const sid = (()=>{ try { return JSON.parse(e.data).sid; } catch { return "?"; } })();
+      const tip = document.createElement("div");
+      tip.className = "delta-line";
+      tip.style.color = "#9ca3af";
+      tip.textContent = `SSE 已连接 (sid=${sid})`;
+      logDelta.appendChild(tip);
+    });
+
+    es.onerror = () => {
+      showWarn(warnAsr, "SSE 连接出错或中断");
+      showWarn(warnDelta, "SSE 连接出错或中断");
+      showWarn(warnRtsp, "SSE 连接出错或中断");
+    };
+  }
+
+  // ========== 表单：离线 ==========
+  $("#formUpload").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const f = $("#file").files[0];
+    if (!f) return setStatus("请选择文件", false);
+
+    // 本地预览
+    try {
+      const url = URL.createObjectURL(f);
+      player.src = url; player.play().catch(()=>{});
+      playerNote.innerHTML = `<b>本地预览：</b>${f.name}`;
+    } catch {}
+
+    const fd = new FormData();
+    fd.append("file", f);
+    fd.append("slice_sec", $("#slice_sec_up").value || "5");
+    fd.append("vlm_system_prompt", $("#vlm_prompt").value || "请描述画面内容，突出重点");
+    fd.append("vlm_streaming", $("#vlm_streaming").value);
+    fd.append("cut_interval_sec", $("#cut_interval_sec").value || "1.0");
+    fd.append("cut_diff_method", $("#cut_diff_method").value || "bgr_ratio");
+    fd.append("cut_diff_threshold", $("#cut_diff_threshold").value || "0.5");
+
+    $("#btnUpload").disabled = true;
+    setStatus("上传中…");
+    try {
+      const r = await fetch("/upload", { method:"POST", body: fd });
+      const j = await r.json();
+      if (!r.ok || !j.ok) throw new Error(j.error || "上传失败");
+      setStatus(`离线任务已启动，job_id=${j.job_id}`);
+      connectSSE(j.job_id);
+    } catch(e){ setStatus(e.message||"请求失败", false); }
+    finally { $("#btnUpload").disabled = false; }
+  });
+
+  // ========== 表单：RTSP ==========
+  $("#formRtsp").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const preset = $("#vlm_preset").value;
+    const url = $("#rtsp_url").value.trim();
+    if (!preset) return setStatus("请选择内置提示词 Preset", false);
+    if (!url) return setStatus("请输入 RTSP 地址", false);
+
+    // 清空 <video>，提示本地播放器
+    player.removeAttribute("src"); player.load();
+    playerNote.innerHTML = `RTSP 无法在浏览器直接播放，已请求服务端 <b>本地打开播放器</b>。<br/>地址：<code>${url}</code>`;
+
+    const fd = new FormData();
+    fd.append("rtsp_url", url);
+    fd.append("vlm_preset", preset);
+    fd.append("slice_sec", $("#slice_sec_rtsp").value || "4");
+    fd.append("cut_interval_sec", $("#rtsp_interval").value || "2.0");
+    fd.append("cut_diff_method", "gray_mean");
+    fd.append("cut_diff_threshold", $("#rtsp_threshold").value || "0.55");
+    fd.append("open_local_player", $("#open_local_player").value || "true");  // 修正参数名
+    fd.append("vlm_event_min_level", $("#event_min_level").value || "LOW");   // 传事件筛选等级
+
+    $("#btnRtsp").disabled = true;
+    setStatus("启动 RTSP 分析…");
+    try {
+      const resp = await fetch("/rtsp", { method:"POST", body: fd });
+      const j = await resp.json();
+      if (!resp.ok || !j.ok) throw new Error(j.error || "启动失败");
+      setStatus(`RTSP 任务已启动，job_id=${j.job_id}，本地播放器=${j.viewer}`);
+      connectSSE(j.job_id);
+    } catch(e){ setStatus(e.message||"请求失败", false); }
+    finally { $("#btnRtsp").disabled = false; }
+  });
+
+  // ========== 停止：POST /stop ==========
+  $("#btnStop").addEventListener("click", async () => {
+    try {
+      const r = await fetch("/stop", { method:"POST" });
+      const j = await r.json();
+      if (!r.ok || !j.ok) throw new Error(j.error || "停止失败");
+      setStatus(`任务已停止`);
+      if (es) { es.close(); es = null; }
+    } catch(e){ setStatus(e.message||"请求失败", false); }
+  });
+
+  // ========== 清空三栏 ==========
+  $("#btnClear").addEventListener("click", () => {
+    [logAsr, logDelta, logRtsp].forEach(el => el.innerHTML="");
+    [warnAsr, warnDelta, warnRtsp].forEach(clearWarn);
+  });
+
+  // 初始：不带 job_id 连接 SSE
+  connectSSE(null);
+})();
+</script>
+</body>
+</html>

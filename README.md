@@ -1,335 +1,165 @@
-<h1>
-  Streaming Analyze Video Audio (A/B/C) — 端到端音视频流式理解
-  <img src="logo.png" alt="Streaming Analyze Logo" width="32" style="vertical-align: middle; margin-left: 8px;">
-</h1>
+# 🚀 StreamingAnalyze — 智能流式音视频分析系统（A/B/C）
 
-[![GitHub stars](https://img.shields.io/github/stars/June2124/streaming_analyze_video_audio?style=social)](https://github.com/June2124/streaming_analyze_video_audio/stargazers)
-[![GitHub forks](https://img.shields.io/github/forks/June2124/streaming_analyze_video_audio?style=social)](https://github.com/June2124/streaming_analyze_video_audio/network/members)
-[![Issues](https://img.shields.io/github/issues/June2124/streaming_analyze_video_audio)](https://github.com/June2124/streaming_analyze_video_audio/issues)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-![Python](https://img.shields.io/badge/Python-3.9%20%7C%203.10%20%7C%203.11-blue)
-![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-informational)
-![FFmpeg](https://img.shields.io/badge/FFmpeg-required-important)
-![OpenCV](https://img.shields.io/badge/OpenCV-required-informational)
-![DashScope](https://img.shields.io/badge/DashScope-optional-success)
-
-> **系统概述**  
-> 实时/离线 **多线程** 流式音视频分析框架：A 线程切片标准化 → B 线程 **VLM** 视觉解析（**SSE 增量** + 片尾收尾）→ C 线程 **ASR** 句级转写（VAD 跳过），主控提供 **run_stream** 实时事件总线（VLM 增量 + ASR 段尾）、**run_and_return** 汇总返回，以及对齐/节流守护。
+> 端到端多线程流式音视频理解系统  
+> **A：视频切片与标准化** → **B：视觉理解 (VLM)** → **C：语音识别 (ASR)**  
+> 支持 **离线文件** 与 **RTSP 实时流**；内置 **FastAPI 后端**、**原生前端页面**、**三大配置类**。
 
 ---
 
-## ✨ 关键词
-流式、实时、离线、增量、句级、VLM、ASR、视频理解、音频转写、FFmpeg、OpenCV、DashScope、SSE、RTSP、关键帧、小视频、对齐、节流、线程、Python
+## 目录（ToC）
+
+- [项目简介](#项目简介)
+- [架构与数据流](#架构与数据流)
+- [目录结构](#目录结构)
+- [安装与运行](#安装与运行)
+- [环境变量](#环境变量)
+- [后端接口（FastAPI）](#后端接口fastapi)
+- [前端页面说明](#前端页面说明)
+- [监控与日志](#监控与日志)
+- [License](#license)
 
 ---
 
-## 🚀 快速上手
-```bash
-git clone https://github.com/June2124/streaming_analyze_video_audio.git
-cd streaming_analyze_video_audio
-pip install -r requirements.txt
-# Windows/Mac/Linux 请先安装 FFmpeg 并加入 PATH
+## 🌟 项目简介
 
-> 切片（A）→ 视觉解析（B, VLM）→ 语音转写（C, ASR）  
-> 支持离线文件与实时 RTSP，提供 **同步流式生成器**、**一次性汇总**、与 **自定义回调** 三种使用方式。
+**StreamingAnalyze** 将音视频源切为窗口片段并并行处理：
 
-<p align="center">
-  <img alt="Python" src="https://img.shields.io/badge/python-3.10%2B-blue.svg">
-  <img alt="ffmpeg" src="https://img.shields.io/badge/FFmpeg-required-green.svg">
-  <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-lightgrey.svg">
-</p>
+- **A 线程（`worker_a_cut`）**：基于 FFmpeg 切片并标准化输出  
+  - 视频：无声 MP4（直接用于 VLM）  
+  - 音频：16kHz 单声道 WAV（供 ASR）  
+  - 失败时自动从“流拷贝”回退到“重编码”，提升鲁棒性
+- **B 线程（`worker_b_vlm`）**：视觉理解（VLM），支持**流式增量**与**完整段**输出
+- **C 线程（`worker_c_asr`）**：语音识别（ASR），支持**增量转写**、**静音跳过**与**完整文本**
+- **主控（`StreamingAnalyze`）**：调度 A/B/C、状态监控、通过 **SSE** 实时推送到浏览器三大面板
 
+---
 
-## ✨ 功能亮点
+## 🧩 架构与数据流
 
-- **多模态并行**：视频送 VLM、音频送 ASR，主控统一对齐与节流。支持：离线音频、离线无声视频、离线音视频、RTSP实时流。  
-- **三种调用模式**：
-  - `run_stream()`：边跑边拿 **原始事件**（推荐）
-  - `run_and_return()`：任务完成后一次性返回结果（离线友好）
-  - **自定义回调**：接入你自己的 UI/消息总线
-- **切片与取帧策略**  
-按模式把原始流切成短窗（SECURITY/ONLINE 短窗、OFFLINE 稍长且可重叠），每窗先做轻量运动检测：**无显著运动→固定等分抽帧**，**有显著运动→按间隔关键帧**；仅 **OFFLINE** 在显著运动时尝试产出“小视频”。
-- **稳健兜底**  
-抽帧优先用 **OpenCV**，失败自动切换 **FFmpeg** 抓帧；若小视频压缩失败，也会回落到关键帧/固定抽帧，尽量保证每段都有可供 VLM 消费的可视输入。
-- **时间对齐**：事件携带 `_meta.emit_ts/emit_iso` 与媒体时间 `t0/t1`，便于拼接上下文  
-- **可配置策略**：离线/在线/安防三套关键帧/小视频策略可切换  
-- **稳健收尾**：慢停/快停机制，异常自动广播 STOP
+```
+            ┌──────────────────────────────┐
+            │        StreamingAnalyze       │
+            │   主控：调度 / SSE / 统计 / 对齐  │
+            └───────┬───────────┬──────────┘
+                    │                           (SSE 事件)
+                    │                           ─────────► 前端三面板
+           ┌────────┘           └───────────┐
+           ▼                                  ▼
+   [A] worker_a_cut.py                 [C] worker_c_asr.py
+   FFmpeg 切片/标准化                     语音识别（增量/整段）
+           │
+           ▼
+   [B] worker_b_vlm.py
+   视觉理解（流式/非流式）
+```
 
+事件通过 **SSE** 推送到前端：**语音转录** / **视觉理解** / **RTSP 安防检测** 三个面板分栏显示。
 
-## 🧩 体系结构
+---
 
-            +---------------------------+
-            |   StreamingAnalyze 主控   |
-            |  (管控/监控/快慢停/节流)  |
-            +-----+---------------------+
-                  | START / STOP / MODE / SLICE
-       ┌──────────┴──────────┐
-       |                      |
-   [A 切片/标准化]        输出消费者(异步)
-       |                      |
-  q_video ───────────────► OUT-VLM → 回调/打印/汇总/事件队列
-  q_audio ───────────────► OUT-ASR → 回调/打印/汇总/事件队列
-       |                      ^
-       v                      |
-   [B VLM 解析]          run_stream() 迭代器
-   [C ASR 转写]
+## 📦 目录结构
 
-
-- **A**：切窗 + 标准化，按策略产出“小视频/关键帧（给 B）”与“WAV（给 C）”
-- **B**：视觉模型流式增量（delta）与收尾（done）
-- **C**：ASR 句级收尾（默认；如需字级可改 C 侧策略）
-- **主控**：统一管理线程、控制面消息、STOP 策略、对齐/节流（`TranscriptPlaybackSkewController`）
-
-
-## 📦 目录结构（核心文件）
-
+```
 .
-├─ streaming_analyze.py          # 主控：A/B/C 管线、三种使用方式、便捷回调
-├─ run_stream_example.py        # 使用示例
+├─ app_service.py                # FastAPI 入口
+├─ index.html                    # 前端页面（原生 HTML + SSE）
+├─ streaming_analyze.py          # 主控（A/B/C 管线 + SSE 事件总线）
+├─ run_stream_example.py         # 仅后端调用示例
 ├─ src/
 │  ├─ workers/
-│  │  ├─ worker_a_cut.py        # A: 切片/标准化/策略/关键帧/小视频
-│  │  ├─ worker_b_vlm.py        # B: VLM 流式解析（DashScope MMC）
-│  │  └─ worker_c_asr.py        # C: ASR 句级识别（Paraformer）
+│  │  ├─ worker_a_cut.py
+│  │  ├─ worker_b_vlm.py
+│  │  └─ worker_c_asr.py
+│  ├─ configs/
+│  │  ├─ asr_config.py           # AsrConfig（过滤语气词/语义断句/逆文本正则化等）
+│  │  ├─ cut_config.py           # CutConfig（切片/采样策略/阈值等）
+│  │  └─ vlm_config.py           # VlmConfig（提示词/流式/事件级别等）
 │  ├─ utils/
-│  │  ├─ ffmpeg_utils.py        # FFmpeg音视频标准化、静音探测、切窗等工具
-│  │  ├─ skew_guard.py          # TranscriptPlaybackSkewController
-│  │  └─ logger_utils.py
-│  └─ all_enum.py               # MODEL / SOURCE_KIND
-
-## 🔧 前置依赖
-
-- **Python** 3.10+
-- **FFmpeg**（必须）  
-  - Windows：把 `ffmpeg.exe` 加入 PATH  
-  - macOS：`brew install ffmpeg`  
-  - Linux：`apt/yum` 安装
-- **SDK**
-  - 视觉：`pip install dashscope`
-  - ASR（Paraformer，可选）：`pip install dashscope`（与上相同）
-  - 可选 VAD：`pip install webrtcvad-wheels`（Windows 可用的轮子）
-
-## ⚙️ 环境变量（常用）
-
-> 可写入 `.env` 或直接在环境中设置
-
-| 变量 | 说明 | 默认 |
-|---|---|---|
-| `DASHSCOPE_API_KEY` | 阿里云百炼 API Key | — |
-| `VLM_MODEL_NAME` | VLM 模型名（B） | `qwen3-vl-plus` |
-| `VLM_USER_PROMPT` | 全局提示词（若不设，按模式默认） | — |
-| `VLM_USER_PROMPT_OFFLINE/ONLINE/SECURITY` | 分模式提示词 | 内置默认 |
-| `ASR_MODEL` | Paraformer 模型名（C） | `paraformer-realtime-v2` |
-| `ASR_VAD_ENABLED` | 是否启用内置 VAD 预判 | `1` |
-| `EMIT_MAX_SKEW_S` | 跨通道最大视觉领先 | `3.0` |
-| `EMIT_RATE_LIMIT_HZ` | 消费限速（Hz） | `8.0` |
-
-```
-
-## 📦开箱即用
-
-### 1) 边跑边拿：`run_stream()`（推荐）
-
-```python
-from streaming_analyze import StreamingAnalyze
-from src.all_enum import MODEL
-
-# ❗ 示例 RTSP（占位）：请替换为你的真实相机地址
-# e.g. "rtsp://user:pass@192.168.1.10:554/Streaming/Channels/101"
-RTSP_URL = "rtsp://user:pass@camera-host:554/live/stream"  # <--- 替换为真实地址
-
-ctrl = StreamingAnalyze(
-    url=RTSP_URL,
-    mode=MODEL.ONLINE,   # ONLINE / OFFLINE / SECURITY
-    slice_sec=5,
-    enable_b=True,       # 开 VLM
-    enable_c=True,        # 开 ASR
-    ew_guard_enabled=None #关闭对齐与节流
-)
-
-for ev in ctrl.run_stream(print_vlm=False, print_asr=False, max_secs=60):
-    # 每条事件都包含 _meta.emit_ts / _meta.emit_iso（事件产生时间）
-    # VLM: type in {"vlm_stream_delta","vlm_stream_done"}，含 seg 媒体时间 t0/t1
-    # ASR: type == "asr_stream_done"（句级），含 seg 媒体时间 t0/t1 与（如可用）句内时间戳
-    print(ev)
-
-# 可在任意时刻：
-# ctrl.force_stop("manual stop")
-```
-
-### 2) 一次性返回：`run_and_return()`（离线友好）
-
-```python
-from streaming_analyze import StreamingAnalyze
-from src.all_enum import MODEL
-
-ctrl = StreamingAnalyze(
-    url=r"D:\streaming_analyze_video_audio\static\video\RAG_Video_with_sound_test.mp4",
-    mode=MODEL.OFFLINE,
-    slice_sec=5,
-    enable_b=True,
-    enable_c=True,
-    ew_guard_enabled=None #关闭对齐与节流
-)
-
-result = ctrl.run_and_return(print_vlm=False, print_asr=False)
-# 结构：
-# {
-#   "vlm": {"deltas": [...], "dones": [...]},
-#   "asr": {"dones": [...]}
-# }
-print(result)
-```
-
-### 3) 简单打印：`run_simple()`（演示/调试）
-
-```python
-from streaming_analyze import StreamingAnalyze
-from src.all_enum import MODEL
-
-StreamingAnalyze(
-    url=r"D:\path\video.mp4",
-    mode=MODEL.OFFLINE,
-    slice_sec=5,
-    enable_b=True,
-    enable_c=True,
-    ew_guard_enabled=None #关闭对齐与节流
-).run_simple(print_vlm=True, print_asr=True)
+│  │  ├─ ffmpeg_utils.py 
+│  │  ├─ logger_utils.py
+│  │  ├─ backpressure.py         # 可选：背压控制
+│  │  └─ skew_guard.py           # 可选：VLM/ASR 发射对齐/限速
+│  └─ all_enum.py                # MODEL / SOURCE_KIND 等枚举
+├─ requirements.txt
+└─ uploads/                      # 运行期上传/切片输出
 ```
 
 ---
 
-## 🧪 事件规范（片段化媒体时间 + 产生时间）
+## ⚙️ 安装与运行
 
-**公共字段：**
+### 1) 克隆与安装依赖
 
-| 字段 | 含义 |
-|---|---|
-| `segment_index` | 片段序号（A 切片产生） |
-| `t0` / `t1` | 片段媒体时间（秒），来自 A |
-| `_meta.emit_ts` / `_meta.emit_iso` | 事件产生的时钟时间（用于 UI 排序等） |
-| `model` | 后端模型名（B/C） |
-
-**VLM（B）事件：**
-
-- 增量：  
-  `{"type":"vlm_stream_delta","delta":"...","seq":1,"media_kind":"video|images","t0":..,"t1":..,"_meta":{...}}`
-- 收尾：  
-  `{"type":"vlm_stream_done","full_text":"...","latency_ms":1234,"media_used":[...],"origin_policy":"...","t0":..,"t1":..,"_meta":{...}}`
-
-**ASR（C）事件（默认句级，仅收尾）：**
-- 句级收尾：  
-  `{"type":"asr_stream_done","full_text":"...","latency_ms":1234,"sentence_times":[{"start_ts":..,"end_ts":..}, ...],"t0":..,"t1":..,"_meta":{...}}`
-
-> 需要**字级增量**？在 `worker_c_asr.py` 中切换策略（示例已留注释，默认是句级）。
-
- **历史摘要回带（B 线程）**  
-  - 从第 2 段起，把上一轮（最多 N 轮，默认 30）VLM 的“段级摘要”拼接进提示词，让模型在理解上下文的基础上工作。
-   - 推荐的提示词片段（可按业务微调）：
-     ```
-     你正在按时间顺序总结视频/关键帧。以下为历史摘要（可能为空）：
-     ---
-     ${HISTORY}
-     ---
-     规则：
-     - 仅输出 **相较历史的新增信息**；若没有新增，输出“无新增”或留空。
-     - 使用要点化/项目符号；避免重复历史描述；不要复述相同场景不变的元素。
-     - 如果出现新的动作、文字、水印、数值、场景或人物变化，请明确指出。
-     ```
-
----
-
-## ⏱️ 对齐与节流（Skew Guard）
-
-- `TranscriptPlaybackSkewController` 控制不同通道（VLM/ASR）向外发射的**速率**与**相对领先**，避免 UI 抖动/过载  
-- 核心环境变量：
-  - `EMIT_MAX_SKEW_S`：VLM 可领先播放进度的最大秒数  
-  - `EMIT_RATE_LIMIT_HZ`：每通道事件外发的上限频率（Hz）
-
----
-
-## ⚙️ 性能 & 参数建议
-
-- `slice_sec` 过小：上下文短、VLM/ASR 开销增加；过大：时延变高。一般 **5~10s** 较均衡  
-- OFFLINE 策略默认：**显著运动 → 小视频**；**非显著 → 关键帧**（更省流）  
-- SECURITY 模式：静场固定抽帧，运动时加密关键帧  
-- 设备受限时：降低小视频 `height/fps`，或减少关键帧 `max_frames`
-
----
-
-## 🛠️ 故障排查
-
-- **没有任何输出？**  
-  - 检查 FFmpeg 是否在 PATH  
-  - 本地路径/RTSP 是否可读  
-  - DashScope SDK 是否安装，`DASHSCOPE_API_KEY` 是否可用
-- **B/C 线程提前退出**：主控会快停并打印原因  
-- **监控线程失败**：降级无监控模式，不影响主流程
-
----
-
-## 🔒 停止策略
-
-- **离线**：A 切到 EOF → 主控发 STOP → 等 B/C 自然退出 → 关消费者与监控（慢停）  
-- **实时**：A 常驻；`force_stop()` 任意时刻触发快停  
-- **异常**：B/C 任一早死 → 主控巡检后广播 STOP（快停）
-
----
-
-## 🧭 路线图
-
-- [ ] ASR 字级/句级切换 & 两路同时产出（可配置）  
-- [ ] 多后端 VLM 适配层  
-- [ ] 关键帧抽取策略自动调优（结合静音/运动）
-
----
-
-## 🤝 贡献
-
-欢迎提交 Issue / PR！  
-建议提交前先跑 `run_stream_example.py`，并附上系统/日志片段。
-技术交流也可发送到作者邮箱: 13594053100@163.com
-
----
-
-## 📜 许可
-
-Apache-2.0
-This project is licensed under the Apache License 2.0.
-
-Copyright (c) 2025 June997
-
-You may obtain a copy of the License at:
-
-- https://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
----
-
-## 📎 附：最小化演示（可直接复制运行）
-
-```python
-# mini_demo.py
-from streaming_analyze import StreamingAnalyze
-from src.all_enum import MODEL
-
-ctrl = StreamingAnalyze(
-    url=r"D:\streaming_analyze_video_audio\static\video\RAG_Video_with_sound_test.mp4",
-    mode=MODEL.OFFLINE,
-    slice_sec=5,
-    enable_b=True,
-    enable_c=True,
-    ew_guard_enabled=None #关闭对齐与节流
-)
-
-for ev in ctrl.run_stream(print_vlm=False, print_asr=False):
-    print(ev)  # 每条都带 _meta.emit_iso 与媒体 t0/t1
+```bash
+git clone https://github.com/June2124/streaming_analyze_video_audio
+cd streaming_analyze_video_audio
+pip install -r requirements.txt
 ```
 
-> RTSP 示例（占位）：`rtsp://user:pass@camera-host:554/live/stream`  
-> 请替换为你自己的相机地址进行测试。
+### 2) 启动服务
+
+```bash
+uvicorn app_service:app --host 0.0.0.0 --port 8000
+```
+
+（也可在本地将 `--host` 改为 `127.0.0.1`）
+
+---
+
+## 🔑 环境变量
+
+```bash
+# DASHSCOPE 模型平台 API Key
+export DASHSCOPE_API_KEY="sk-xxxxxxxx"
+
+# （可选）指定自定义 ffmpeg/ffprobe，可不设（默认走系统 PATH）
+export FFMPEG_BIN="$(which ffmpeg)"
+export FFPROBE_BIN="$(which ffprobe)"
+```
+
+> Windows（PowerShell）请使用：
+>
+> ```powershell
+> $env:DASHSCOPE_API_KEY="sk-xxxxxxxx"
+> $env:FFMPEG_BIN="C:\path\to\ffmpeg.exe"
+> $env:FFPROBE_BIN="C:\path\to\ffprobe.exe"
+> ```
+
+---
+
+## 🔌 后端接口（FastAPI）
+
+| 路径        | 方法   | 说明                                   |
+|-------------|--------|----------------------------------------|
+| `/upload`   | POST   | 上传离线文件并启动分析（音/视频均可）     |
+| `/rtsp`     | POST   | 启动 RTSP 实时分析                       |
+| `/stop`     | POST   | 停止当前任务                             |
+| `/events`   | GET    | SSE 事件流（前端使用 EventSource 订阅）  |
+
+---
+
+## 🖥️ 前端页面说明
+
+- **左栏**：上传离线文件或启动 RTSP  
+- **右上**：视频播放器（仅离线文件可本地预览）  
+- **右下三栏**：  
+  - **语音转录（ASR）**：增量 + 完整文本  
+  - **视觉理解（VLM）**：打字机效果渲染；RTSP 安防为结构化事件卡片  
+  - **RTSP 安防检测**：事件等级 / 置信度 + 证据帧缩略图  
+
+页面使用原生 `EventSource('/events?...')` 订阅 **SSE**，无需前端框架。
+
+---
+
+## 🧭 监控与日志
+
+- 周期打印：`[监控] 队列水位 VIDEO=… AUDIO=… VLM=… ASR=… | 线程存活={…}`  
+- **A 线程**：每个片段的视频/音频产物路径  
+- **B/C 线程**：增量/完成事件与统计汇总（平均/最大延迟、字符数、段数等）
+
+---
+
+## 📜 License
+
+Apache-2.0  
+© 2025 June2124

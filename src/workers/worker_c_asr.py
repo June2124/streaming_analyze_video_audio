@@ -10,6 +10,8 @@ import threading
 from datetime import datetime
 from typing import Optional, Dict, Any, Iterable, List, Tuple
 
+from src.configs.asr_config import AsrConfig
+
 logger = logging.getLogger("src.workers.worker_c_asr")
 
 # ----------- 可选：WebRTC VAD -----------
@@ -127,7 +129,7 @@ def _analyze_vad_active_ratio(
                 dbfs = -90.0
             else:
                 dbfs = 20.0 * math.log10(rms / 32768.0 * 2.0)
-            if dbfs > energy_dbfs_thresh:
+            if dbfs > energy_dbfs_thresh: 
                 act += 1
             total += 1
         ratio = (act / total) if total else 0.0
@@ -141,7 +143,7 @@ def _analyze_vad_active_ratio(
         return {"is_speech": True, "active_ratio": 1.0, "backend_used": "disabled", "applied_params": applied}
 
 
-# ======== Paraformer 回调：收 sentence_end 句级结果 ========
+# Paraformer 回调：收 sentence_end 句级结果 
 class _ParaCallback(RecognitionCallback):
     def __init__(self):
         self.sentences: List[dict] = []  # 仅存 sentence_end=True 的句对象
@@ -214,6 +216,7 @@ def worker_c_asr(
     q_asr: "queue.Queue[Dict[str, Any]]",
     q_ctrl: "queue.Queue[Dict[str, Any]]",
     stop: object,
+    asr_config:Optional[AsrConfig] = None
 ):
     """
     - 从 q_audio 取离线 wav 段，先做 VAD 预判，再推往 Paraformer 做识别。
@@ -229,6 +232,11 @@ def worker_c_asr(
     lang = os.getenv("ASR_LANG", "zh")
     sr_hz = 16000
     block_bytes = 3200  # 100ms
+    disfluency_removal_enabled = asr_config.disfluency_removal_enabled
+    semantic_punctuation_enabled = asr_config.semantic_punctuation_enabled
+    max_sentence_silence = asr_config.max_sentence_silence
+    punctuation_prediction_enabled = asr_config.punctuation_prediction_enabled
+    inverse_text_normalization_enabled = asr_config.inverse_text_normalization_enabled
 
     # VAD
     vad_enabled = os.getenv("ASR_VAD_ENABLED", "1") == "1"
@@ -247,6 +255,7 @@ def worker_c_asr(
                     logger.info("[C] 收到控制队列 STOP ，退出")
                     return False
                 try:
+                    # 其他消息放回队列
                     q_ctrl.put_nowait(ctrl)
                 except queue.Full:
                     pass
@@ -279,6 +288,7 @@ def worker_c_asr(
                         logger.info("[C] 收到控制队列 STOP ，退出")
                         return
                     try:
+                        # 其他消息放回队列
                         q_ctrl.put_nowait(msg)
                     except queue.Full:
                         pass
@@ -358,7 +368,11 @@ def worker_c_asr(
                 model=os.getenv("ASR_MODEL", "paraformer-realtime-v2"),
                 format='pcm',
                 sample_rate=sr_hz,
-                semantic_punctuation_enabled=True,
+                semantic_punctuation_enabled=semantic_punctuation_enabled,
+                disfluency_removal_enabled=disfluency_removal_enabled,
+                max_sentence_silence=max_sentence_silence,
+                punctuation_prediction_enabled=punctuation_prediction_enabled,
+                inverse_text_normalization_enabled=inverse_text_normalization_enabled,
                 callback=cb
             )
 

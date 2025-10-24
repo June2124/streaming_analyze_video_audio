@@ -1,97 +1,72 @@
+from __future__ import annotations
 '''
 Author: 13594053100@163.com
 Date: 2025-10-17 15:21:53
-LastEditTime: 2025-10-17 15:22:00
+LastEditTime: 2025-10-24 17:42:13
 '''
-
-from __future__ import annotations
 # -*- coding: utf-8 -*-
-
 import os
 import queue
 import threading
 import time
 from typing import List, Optional, Callable, Dict, Any, Iterator
 
+
 from src.all_enum import MODEL, SOURCE_KIND
 from src.utils import logger_utils
 from src.utils.ffmpeg_utils import FFmpegUtils
 from src.workers import worker_a_cut, worker_b_vlm, worker_c_asr
+from src.configs.vlm_config import VlmConfig
+from src.configs.asr_config import AsrConfig
+from src.configs.cut_config import CutConfig
 
 try:
     from src.utils.backpressure import AVBackpressureController
 except Exception:
-    AVBackpressureController = None  # type: ignore
+    AVBackpressureController = None
 try:
     from src.utils.skew_guard import TranscriptPlaybackSkewController
 except Exception:
-    TranscriptPlaybackSkewController = None  # type: ignore
+    TranscriptPlaybackSkewController = None
 
 logger = logger_utils.get_logger(__name__)
 
 
 class StreamingAnalyze:
-    
     """
     流式音视频分析主控（A/B/C 线程：切片→视觉解析→语音转写）
 
-    线程拓扑  
-        A：切片与标准化（输出：小视频/关键帧给 B；WAV 给 C）  
-        B：视觉解析（流式增量 + 收尾）  
-        C：ASR 转写（默认句级收尾；需要字级请改 C 线程策略）  
+    线程拓扑
+        A：切片与标准化（输出：小视频/关键帧给 B；WAV 给 C）
+        B：视觉解析（流式增量 + 收尾）
+        C：ASR 转写（默认句级收尾；需要字级请改 C 线程策略）
         OUT-*：内部消费者；统一做回调/打印；并把原始事件推送给 `run_stream()` 生成器
 
     用法（3选1）:
       1) run_stream(): 启动后台管线并返回一个“同步生成器”
-         - VLM：持续按增量事件 yield（含原始 B 侧 payload）
-         - ASR：持续按“句级收尾” yield（含原始 C 侧 payload）
       2) run_and_return(): 任务结束后一次性返回汇总（适合离线文件）
-         - VLM：汇总 deltas/dones
-         - ASR：汇总句级 dones（可在 C 侧改回字级）
       3) 自定义回调：设置 on_vlm_delta/on_vlm_done/on_asr_*，由内部 OUT-* 消费者实时触发
-
-    重要参数:
-      - url: 本地文件或 rtsp/rtsps
-      - mode: MODEL.ONLINE / OFFLINE / SECURITY # 离线视频选择OFFLINE、实时流会议直播等场景选择ONLINE、实时流安防摄像头等场景选择SECURITY; 详见work_a_cut.py
-      - slice_sec: A 侧切窗秒数
-      - enable_b / enable_c: 是否启用 VLM / ASR 分支
-
-    行为与约束:
-      - 单实例不可并发运行多个任务；可串行多次调用
-      - 离线：A 切到 EOF 后“慢停”，等 B/C 消费完自然退出
-      - 实时：A 常驻；随时 force_stop("reason") 快停
-      - 任一 B/C 异常退出 → 主控检测到后广播 STOP（快停）
-      - 内置 TranscriptPlaybackSkewController：跨通道节流&对齐（可通过开关禁用/环境变量配置）
-
-    事件时间戳:
-      - 所有 run_stream 产出的事件都带 _meta.emit_ts / _meta.emit_iso
-      - VLM 事件携带片段 t0/t1（由 A 侧提供）
-      - ASR 事件为句级 done；含 t0/t1 与（如可用）句内时间戳列表
-
-    常用环境变量  
-        `EMIT_SKEW_GUARD`：是否启用对齐/节流（"1/true/on/yes" 开启；"0/false/off/no" 关闭；默认开启）  
-        `EMIT_MAX_SKEW_S`, `EMIT_RATE_LIMIT_HZ` —— 对齐/节流参数  
-        `VLM_MODEL_NAME`, `VLM_USER_PROMPT_*` —— VLM 配置  
-        `ASR_MODEL`, `ASR_VAD_*` —— ASR/VAD 配置
     """
 
     def __init__(
         self,
         url: str,
         mode: MODEL,
-        slice_sec: Optional[int] = None, # SECURITY模式建议 4~8s; ONLINE模式建议 5~10s；OFFLINE模式建议: 8~12s
+        slice_sec: Optional[int] = None,  # SECURITY: 4~8s; ONLINE: 5~10s; OFFLINE: 8~12s
         *,
         enable_b: bool = True,
         enable_c: bool = True,
-        skew_guard_enabled: Optional[bool] = None,  # 对齐/节流总开关
+        skew_guard_enabled: bool = False,
+        vlm_config: Optional[VlmConfig] = None,
+        asr_config: Optional[AsrConfig] = None,
+        cut_config: Optional[CutConfig] = None,
     ):
         if not isinstance(mode, MODEL):
             raise ValueError(f"mode 只接受 MODEL 枚举，但传入了 {type(mode)}")
-        
+
         _check_url_legal(url)
         FFmpegUtils.ensure_ffmpeg()
 
-        # 按模式给默认窗口（秒）
         default_slice = {
             MODEL.ONLINE: 6,
             MODEL.SECURITY: 6,
@@ -99,16 +74,18 @@ class StreamingAnalyze:
         }[mode]
 
         if slice_sec is None:
-            slice_val = default_slice # 不显示传参, 则按照工作模式, 给出系统默认值
+            slice_val = default_slice
         else:
-            if not isinstance(slice_sec, int) or not (0 < slice_sec < 30):
-                raise ValueError("切窗参数必须是 (4, 30) 之间的正整数(单位s); 注意: slice_sec参数与首帧响应时间、CPU消耗正相关, Token消耗负相关。")
-            slice_val = slice_sec 
-
+            if not isinstance(slice_sec, int) or not (1 <= slice_sec <= 30):
+                raise ValueError("切窗参数必须是 (1, 30) 之间的正整数(单位s); 注意: slice_sec与首帧响应时间、CPU消耗正相关, Token消耗负相关。")
+            slice_val = slice_sec
 
         self.url = url
         self.mode = mode
-        self.slice_sec = slice_val # 统一写回
+        self.slice_sec = slice_val
+        self.vlm_config = vlm_config or VlmConfig()
+        self.asr_config = asr_config or AsrConfig()
+        self.cut_config = cut_config or CutConfig()
         self._source_kind = _determine_source_kind(url)
         self._have_audio_track = FFmpegUtils.have_audio_track(url)
 
@@ -137,8 +114,10 @@ class StreamingAnalyze:
         # -------- skew_guard 开关解析 --------
         def _str2bool(s: str) -> Optional[bool]:
             s = s.strip().lower()
-            if s in ("1", "true", "on", "yes", "y"):  return True
-            if s in ("0", "false", "off", "no", "n"): return False
+            if s in ("1", "true", "on", "yes", "y"):
+                return True
+            if s in ("0", "false", "off", "no", "n"):
+                return False
             return None
 
         if skew_guard_enabled is None:
@@ -205,6 +184,8 @@ class StreamingAnalyze:
             },
             "vlm": {
                 "segments": 0,
+                "segments_stream": 0,      
+                "segments_nonstream": 0,   
                 "deltas": 0,
                 "text_chars": 0,
                 "latency_ms_sum": 0.0,
@@ -381,25 +362,141 @@ class StreamingAnalyze:
             need_audio_sentinel=(self._have_audio_track and self.enable_c),
         )
 
-    # ---------- 外部强停 ----------
+    def _drain_queue_completely(self, q:queue, max_batch: int = 1000) -> int:
+        """尽最大努力把队列清空，返回丢弃条数。"""
+        dropped = 0
+        if q is None:
+            return 0
+        for _ in range(max_batch):
+            try:
+                q.get_nowait()
+                dropped += 1
+            except Exception:
+                break
+        return dropped
+
+    def _drain_then_inject_stop(self, q:queue, stop_obj:object):
+        """
+        原子操作：先清空队列，再把 STOP 哨兵放进去，保证消费者能立刻收到 STOP 退出。
+        队列满导致 put 失败时，继续丢弃队头并重试最多若干次。
+        """
+        if q is None:
+            return
+        # 先尽量清空
+        self._drain_queue_completely(q, max_batch=100000)
+        # 再确保 STOP 放进去
+        for _ in range(5):
+            try:
+                q.put_nowait(stop_obj)
+                return
+            except Exception:
+                # 丢一个试一个，直到塞进去
+                try:
+                    q.get_nowait()
+                except Exception:
+                    time.sleep(0.01)
+        # 兜底：阻塞一点点时间再试
+        try:
+            q.put(stop_obj, timeout=0.2)
+        except Exception:
+            pass
+
     def force_stop(self, reason: Optional[str] = "无"):
+        """
+        最终版：强停时清空所有生产/消费/对外队列，并保证 STOP 哨兵一定进入各消费者队列。
+        这样避免 B 线程在 q_vlm.put 上无限重试。
+        """
         if getattr(self, "_stopped", False):
             logger.info("[主控] force_stop() 已调用过，本次忽略。")
             return
         self._stopped = True
 
-        logger.info(f"[主控] 外部调用者强制中断，原因：{reason}")
+        logger.info(f"[主控] 外部强停触发，原因：{reason}")
 
+        # 1) 广播 STOP 控制消息给 A/B/C 线程
         try:
             self._broadcast_ctrl({"type": "STOP", "reason": reason})
         except Exception as e:
-            logger.warning(f"[主控] 向控制队列广播 STOP 失败：{e}")
+            logger.warning(f"[主控] 广播 STOP 失败（忽略）：{e}")
 
-        _safe_put(self._Q_VIDEO, self._STOP)
-        _safe_put(self._Q_AUDIO, self._STOP)
+        # 2) 立即给 A 的原始输入通道塞 STOP，让A侧停止切片/抓帧/解码
+        try:
+            if self._Q_VIDEO is not None:
+                self._drain_then_inject_stop(self._Q_VIDEO, self._STOP)
+            if self._Q_AUDIO is not None:
+                self._drain_then_inject_stop(self._Q_AUDIO, self._STOP)
+        except Exception:
+            pass
 
-        self._graceful_stop()
-        logger.info("[主控] 强制退出完成！")
+        # 3) 关键：把 B/C -> OUT 的 _Q_VLM 和 _Q_ASR 清空并注入 STOP
+        #    这样 OUT-VLM/OUT-ASR 两个消费者会立刻退出，不会阻塞生产者
+        try:
+            if self.enable_b and (self._Q_VLM is not None):
+                self._drain_then_inject_stop(self._Q_VLM, self._STOP)
+        except Exception:
+            pass
+        try:
+            if self.enable_c and (self._Q_ASR is not None):
+                self._drain_then_inject_stop(self._Q_ASR, self._STOP)
+        except Exception:
+            pass
+
+        # 4) 对外事件总线也清空，防止外层 run_stream() 还在消费旧事件
+        try:
+            self._drain_queue_completely(self._Q_EVENTS, max_batch=200000)
+        except Exception:
+            pass
+
+        # 5) 停监控线程（避免日志噪声），然后进入优雅收尾
+        try:
+            self._stop_monitor()
+        except Exception:
+            pass
+
+        # 6) 等待各工作线程退出（给一点点时间，不要太久）
+        for t in list(self._threads or []):
+            try:
+                if t and t.is_alive():
+                    t.join(timeout=2.0)
+            except Exception:
+                pass
+
+        # 7) OUT 消费者线程也做一次 STOP 注入（队列可能又被生产者塞了内容）
+        try:
+            if self.enable_b and (self._Q_VLM is not None):
+                self._drain_then_inject_stop(self._Q_VLM, self._STOP)
+            if self.enable_c and (self._Q_ASR is not None):
+                self._drain_then_inject_stop(self._Q_ASR, self._STOP)
+        except Exception:
+            pass
+
+        for t in list(self._consumer_threads or []):
+            try:
+                if t and t.is_alive():
+                    t.join(timeout=1.0)
+            except Exception:
+                pass
+
+        # 8) 置位事件完成标记，让 run_stream() 的外层生成器尽快退出
+        try:
+            self._events_done.set()
+        except Exception:
+            pass
+
+        # === 统一等待所有线程退出（软屏障） ===
+        all_threads = list(self._threads or []) + list(self._consumer_threads or [])
+        wait_deadline = time.time() + 3.0  # 总等 3s，可按需调大/调小
+        while time.time() < wait_deadline:
+            alive = [t.name for t in all_threads if t and t.is_alive()]
+            if not alive:
+                break
+            time.sleep(0.05)
+
+        alive = [t.name for t in all_threads if t and t.is_alive()]
+        if not alive:
+            logger.info("[主控] 强停完成：所有线程已退出，队列已清空并注入 STOP 哨兵。")
+        else:
+            logger.info("[主控] 强停完成：已清空队列并注入 STOP 哨兵，但仍有存活线程（超时未等齐）：%s", alive)
 
     # ---------- 线程管理 ----------
     def _spawn_threads(self):
@@ -416,6 +513,7 @@ class StreamingAnalyze:
                 (self._Q_VIDEO if self.enable_b else None),
                 self._Q_CTRL_A,
                 self._STOP,
+                self.cut_config
             ),
             name="A-切片标准化"
         )
@@ -424,7 +522,7 @@ class StreamingAnalyze:
         if self.enable_b:
             t_b = threading.Thread(
                 target=worker_b_vlm.worker_b_vlm, daemon=True,
-                args=(self._Q_VIDEO, self._Q_VLM, self._Q_CTRL_B, self._STOP,),
+                args=(self._Q_VIDEO, self._Q_VLM, self._Q_CTRL_B, self._STOP, self.vlm_config),
                 name="B-VLM解析"
             )
 
@@ -432,7 +530,7 @@ class StreamingAnalyze:
         if self.enable_c:
             t_c = threading.Thread(
                 target=worker_c_asr.worker_c_asr, daemon=True,
-                args=(self._Q_AUDIO, self._Q_ASR, self._Q_CTRL_C, self._STOP,),
+                args=(self._Q_AUDIO, self._Q_ASR, self._Q_CTRL_C, self._STOP,self.asr_config),
                 name="C-ASR转写"
             )
 
@@ -547,8 +645,13 @@ class StreamingAnalyze:
                     lat = float(item.get("latency_ms") or 0.0)
                 except Exception:
                     lat = 0.0
+                streaming_flag = bool(item.get("streaming"))  # 读取 streaming 标记
                 with self._stats_lock:
                     self._stats["vlm"]["segments"] += 1
+                    if streaming_flag:
+                        self._stats["vlm"]["segments_stream"] += 1
+                    else:
+                        self._stats["vlm"]["segments_nonstream"] += 1
                     self._stats["vlm"]["text_chars"] += text_len
                     self._stats["vlm"]["latency_ms_sum"] += lat
                     if lat > self._stats["vlm"]["latency_ms_max"]:
@@ -623,16 +726,16 @@ class StreamingAnalyze:
         如需打印提示，请设置环境变量 VLM_LOG_SUPPRESS_EMPTY=0。
         事件始终会继续向外发送（run_stream 仍能拿到），不影响统计与回调。
         """
-        # 回调优先（让外部有机会拿到原始 payload 作自定义处理/统计）
+        # 回调优先
         if callable(self.on_vlm_done):
             try:
                 self.on_vlm_done(payload)
-                # 即使回调成功，也继续做下面的“可选日志打印”逻辑（保持与增量一致）
             except Exception as e:
                 logger.warning("[OUT] on_vlm_done 回调异常：%s", e)
 
         text = (payload.get("full_text") or "").strip()
         suppressed = bool(payload.get("suppressed_dup"))
+        streaming_flag = payload.get("streaming")
         suppress_empty_log = os.getenv("VLM_LOG_SUPPRESS_EMPTY", "1") == "1"
 
         # 1) 无新增且为空文本 -> 默认静默；如需提示，切换 env
@@ -641,23 +744,24 @@ class StreamingAnalyze:
                 return
             else:
                 logger.info(
-                    "[✨✨✨VLM无新增 seg#%s kind=%s ms=%s] (与历史一致，已省略)",
+                    "[✨✨✨VLM无新增 seg#%s kind=%s ms=%s streaming=%s] (与历史一致，已省略)",
                     payload.get("segment_index"),
                     payload.get("media_kind"),
                     payload.get("latency_ms"),
+                    streaming_flag,
                 )
                 return
 
         # 2) 正常打印完整文本
         logger.info(
-            "[✨✨✨VLM完整文本 seg#%s kind=%s ms=%s]%s%s",
+            "[✨✨✨VLM完整文本 seg#%s kind=%s ms=%s streaming=%s]%s%s",
             payload.get("segment_index"),
             payload.get("media_kind"),
             payload.get("latency_ms"),
-            (" [仅新增]" if suppressed is False else ""),  # suppressed=False 不一定等同“仅新增”，这里只是标个位
+            streaming_flag,
+            (" [仅新增]" if suppressed is False else ""),
             ("\n" + text) if text else ""
         )
-
 
     def _emit_asr_no_speech(self, payload: Dict[str, Any]):
         t0 = payload.get("t0", 0.0)
@@ -763,8 +867,9 @@ class StreamingAnalyze:
                 vlm = stats["vlm"]
                 avg_lat = (vlm["latency_ms_sum"] / vlm["segments"]) if vlm["segments"] else 0.0
                 logger.info(
-                    "[主控] VLM统计：segments=%d, deltas=%d, text_chars=%d, latency_avg=%.1fms, latency_max=%.1fms",
-                    vlm["segments"], vlm["deltas"], vlm["text_chars"], avg_lat, vlm["latency_ms_max"]
+                    "[主控] VLM统计：segments=%d (stream=%d, nonstream=%d), deltas=%d, text_chars=%d, latency_avg=%.1fms, latency_max=%.1fms",
+                    vlm["segments"], vlm["segments_stream"], vlm["segments_nonstream"],
+                    vlm["deltas"], vlm["text_chars"], avg_lat, vlm["latency_ms_max"]
                 )
             if "asr" in stats:
                 asr = stats["asr"]
@@ -774,7 +879,9 @@ class StreamingAnalyze:
                 )
         except Exception:
             pass
-
+        
+        # 残留线程观察
+        self._log_lingering_threads(where="优雅停止")
         # 通知 run_stream 退出
         self._events_done.set()
         logger.info("[主控] 全部线程结束或已交由进程回收")
@@ -856,158 +963,33 @@ class StreamingAnalyze:
                 self._stats["asr"]["text_chars"] = 0
             if self.enable_b:
                 self._stats["vlm"]["segments"] = 0
+                self._stats["vlm"]["segments_stream"] = 0
+                self._stats["vlm"]["segments_nonstream"] = 0
                 self._stats["vlm"]["deltas"] = 0
                 self._stats["vlm"]["text_chars"] = 0
                 self._stats["vlm"]["latency_ms_sum"] = 0.0
                 self._stats["vlm"]["latency_ms_max"] = 0.0
 
-    # ---------- 便捷：打印到标准输出 ----------
-    def set_stdout_handlers(self, *, print_vlm: bool = True, print_asr: bool = True) -> None:
-        if print_vlm and self.enable_b:
-            def _vlm_delta(p):
-                seg, seq = p.get("segment_index"), p.get("seq")
-                delta = (p.get("delta") or "").strip()
-                if delta:
-                    print(f"[VLMΔ seg#{seg} seq={seq}] {delta}", flush=True)
-
-            def _vlm_done(p):
-                seg = p.get("segment_index")
-                text = (p.get("full_text") or "").strip()
-                print(f"[VLM✓ seg#{seg}] {text}", flush=True)
-
-            self.on_vlm_delta = _vlm_delta
-            self.on_vlm_done = _vlm_done
-
-        if print_asr and self.enable_c:
-            def _asr_delta(p):
-                seg, seq = p.get("segment_index"), p.get("seq")
-                delta = (p.get("delta") or "").strip()
-                if delta:
-                    print(f"[ASRΔ seg#{seg} seq={seq}] {delta}", flush=True)
-
-            def _asr_done(p):
-                seg = p.get("segment_index")
-                text = (p.get("full_text") or "").strip()
-                print(f"[ASR✓ seg#{seg}] {text}", flush=True)
-
-            def _asr_no_speech(p):
-                seg = p.get("segment_index")
-                hint = (p.get("usage") or {}).get("silence_hint") or {}
-                ratio = hint.get("silence_ratio")
-                print(f"[ASR⊘ seg#{seg}] silence_ratio={ratio}", flush=True)
-
-            self.on_asr_delta = _asr_delta
-            self.on_asr_done = _asr_done
-            self.on_asr_no_speech = _asr_no_speech
-
-    def run_simple(self, *, print_vlm: bool = True, print_asr: bool = True, max_secs: float | None = None) -> None:
-        self.set_stdout_handlers(print_vlm=print_vlm, print_asr=print_asr)
-
-        stop_flag = threading.Event()
-
-        def _watchdog():
-            if max_secs and max_secs > 0:
-                t0 = time.time()
-                while not stop_flag.is_set():
-                    if time.time() - t0 >= max_secs:
-                        try:
-                            self.force_stop(f"timeout {max_secs}s")
-                        except Exception:
-                            pass
-                        break
-                    time.sleep(0.2)
-
-        if max_secs and max_secs > 0:
-            threading.Thread(target=_watchdog, daemon=True).start()
-
+    def _log_lingering_threads(self, where: str = "收尾阶段") -> None:
+        """打印仍存活的工作/消费者线程，统一出口，保持唯一事实来源。"""
         try:
-            self.start_streaming_analyze()
-        finally:
-            stop_flag.set()
-
-    # ---------- 便捷：采集并一次性返回 ----------
-    def set_capture_handlers(self, *, capture_vlm: bool = True, capture_asr: bool = True):
-        from threading import RLock
-        self._capture_lock = getattr(self, "_capture_lock", RLock())
-        self._capture_buf  = getattr(self, "_capture_buf", {"vlm": {"deltas": [], "dones": []},
-                                                            "asr": {"deltas": [], "dones": [], "no_speech": []}})
-
-        if capture_vlm and self.enable_b:
-            def _vlm_delta(p):
-                with self._capture_lock:
-                    self._capture_buf["vlm"]["deltas"].append(dict(p))
-            def _vlm_done(p):
-                with self._capture_lock:
-                    self._capture_buf["vlm"]["dones"].append(dict(p))
-            self.on_vlm_delta = _vlm_delta
-            self.on_vlm_done  = _vlm_done
-
-        if capture_asr and self.enable_c:
-            def _asr_delta(p):
-                with self._capture_lock:
-                    self._capture_buf["asr"]["deltas"].append(dict(p))
-            def _asr_done(p):
-                with self._capture_lock:
-                    self._capture_buf["asr"]["dones"].append(dict(p))
-            def _asr_no_speech(p):
-                with self._capture_lock:
-                    self._capture_buf["asr"]["no_speech"].append(dict(p))
-            self.on_asr_delta     = _asr_delta
-            self.on_asr_done      = _asr_done
-            self.on_asr_no_speech = _asr_no_speech
-
-    def run_and_return(self, *, print_vlm: bool = False, print_asr: bool = False,
-                       max_secs: float | None = None) -> dict:
-        self.set_capture_handlers(capture_vlm=True, capture_asr=True)
-        if print_vlm or print_asr:
-            self.set_stdout_handlers(print_vlm=print_vlm, print_asr=print_asr)
-
-        stop_flag = threading.Event()
-
-        def _watchdog():
-            if max_secs and max_secs > 0:
-                t0 = time.time()
-                while not stop_flag.is_set():
-                    if time.time() - t0 >= max_secs:
-                        try:
-                            self.force_stop(f"timeout {max_secs}s")
-                        except Exception:
-                            pass
-                        break
-                    time.sleep(0.2)
-
-        if max_secs and max_secs > 0:
-            threading.Thread(target=_watchdog, daemon=True).start()
-
-        try:
-            self.start_streaming_analyze()
-        finally:
-            stop_flag.set()
-
-        out = {}
-        with getattr(self, "_capture_lock"):
-            if self.enable_b:
-                out["vlm"] = {
-                    "deltas": list(self._capture_buf["vlm"]["deltas"]),
-                    "dones":  list(self._capture_buf["vlm"]["dones"]),
-                }
-            if self.enable_c:
-                out["asr"] = {
-                    "deltas":     list(self._capture_buf["asr"]["deltas"]),
-                    "dones":      list(self._capture_buf["asr"]["dones"]),
-                    "no_speech":  list(self._capture_buf["asr"]["no_speech"]),
-                }
-        return out
-
+            threads = list(self._threads or []) + list(self._consumer_threads or [])
+            alive = [t.name for t in threads if t and t.is_alive()]
+            if alive:
+                logger.warning("[主控] %s仍存活线程：%s", where, ", ".join(alive))
+            else:
+                logger.info("[主控] %s没有残留线程。", where)
+        except Exception as e:
+            logger.debug("[主控] 残留线程检查出错（忽略）：%s", e)
+ 
+   
     # ======================== 原始流式输出生成器 ========================
-    def run_stream(self, *, print_vlm: bool = False, print_asr: bool = False,
-                   max_secs: float | None = None) -> Iterator[Dict[str, Any]]:
+    def run_stream(self, *, max_secs: float | None = None) -> Iterator[Dict[str, Any]]:
         """
         启动整条管线到后台线程，并立即返回一个同步生成器。
-        迭代器会持续 yield 事件（VLM: 增量+收尾；ASR: 仅收尾），直到任务优雅收尾。
+        迭代器会持续 yield 事件（VLM: 增量/收尾；ASR: 仅收尾），直到任务优雅收尾。
         """
-        if print_vlm or print_asr:
-            self.set_stdout_handlers(print_vlm=print_vlm, print_asr=print_asr)
+        
 
         def _runner():
             try:
@@ -1057,6 +1039,45 @@ class StreamingAnalyze:
                 t.join(timeout=2.0)
             except Exception:
                 pass
+    
+    # ========== 通用无阻塞清空 ==========
+    def _drain_queue(self, q: queue.Queue) -> int:
+        """
+        非阻塞地把队列里剩余元素全部取尽，返回丢弃条数。
+        """
+        if q is None:
+            return 0
+        n = 0
+        try:
+            while True:
+                q.get_nowait()
+                n += 1
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+        return n
+
+    def _purge_all_queues(self) -> None:
+        """
+        清空所有数据/控制/事件队列，确保强停后无残留。
+        """
+        dropped = {
+            "VIDEO": self._drain_queue(self._Q_VIDEO),
+            "AUDIO": self._drain_queue(self._Q_AUDIO),
+            "VLM":   self._drain_queue(self._Q_VLM),
+            "ASR":   self._drain_queue(self._Q_ASR),
+            "EVT":   self._drain_queue(self._Q_EVENTS),
+            "CTRL_A": self._drain_queue(self._Q_CTRL_A),
+            "CTRL_B": self._drain_queue(self._Q_CTRL_B) if self.enable_b else 0,
+            "CTRL_C": self._drain_queue(self._Q_CTRL_C) if self.enable_c else 0,
+        }
+        try:
+            logger.info("[主控] 队列已清空：%s", dropped)
+        except Exception:
+            pass
+    
+
 
 
 # ----------------- 工具函数 -----------------
