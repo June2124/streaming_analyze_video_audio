@@ -1,4 +1,4 @@
-# 🚀 StreamingAnalyze — 智能流式音视频分析系统（A/B/C）
+# 🚀 StreamingAnalyze — 智能流式音视频分析及RTSP安防系统
 
 > 端到端多线程流式音视频理解系统  
 > **A：视频切片与标准化** → **B：视觉理解 (VLM)** → **C：语音识别 (ASR)**  
