@@ -79,7 +79,7 @@
 │  │  ├─ logger_utils.py
 │  │  ├─ backpressure.py         # 可选：背压控制
 │  │  └─ skew_guard.py           # 可选：VLM/ASR 发射对齐/限速
-│  └─ all_enum.py                # MODEL / SOURCE_KIND 等枚举
+│  └─ all_enum.py                # RTSP安防内置提示词等枚举
 ├─ requirements.txt
 └─ uploads/                      # 运行期上传/切片输出
 ```
